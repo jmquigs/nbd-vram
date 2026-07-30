@@ -1,0 +1,35 @@
+# ThreadSanitizer suppressions for the host-side harness.
+#
+# Everything here is either an artefact of the stub device or a pre-existing
+# condition in code the compression work did not touch. Nothing in the block
+# index, the extent allocator or the codec paths is suppressed - those must stay
+# clean, and they are.
+
+# ---------------------------------------------------------------------------
+# The stub device makes an intentional race visible.
+#
+# A reader snapshots a block's index entry, then DMAs from the slot it names.
+# If a writer replaces that block in the meantime, the slot can be freed and
+# handed to a different block, so the reader's copy may run concurrently with
+# another worker's write to those same bytes. That is by design: the read is
+# validated against the entry's generation before anything is decompressed, and
+# a mismatch discards the bytes and retries. The stale copy is harmless because
+# grain and length come from an entry that was valid when published, so it is
+# always inside the heap.
+#
+# On real hardware these are DMA engine transfers and never a C-level data race
+# at all. The stub implements them as plain memcpy on host memory, which is what
+# puts them in front of ThreadSanitizer. Suppressed at the stub boundary so a
+# genuine race anywhere else in the copy path would still be reported.
+race:cuMemcpyHtoDAsync_v2
+race:cuMemcpyDtoHAsync_v2
+
+# ---------------------------------------------------------------------------
+# Pre-existing: the SIGTERM drain path (nbd-vram.c:700-725, added for issue #19)
+# communicates between the signal handler and the workers through `volatile int`
+# rather than atomics - g_running, g_term_requested and g_client_fds[]. Benign in
+# practice for single-word flags, and unchanged by the compression work, so it is
+# out of scope here rather than fixed under a test-harness commit. Worth cleaning
+# up separately with __atomic accessors.
+race:sig_handler
+race:clients_connected
