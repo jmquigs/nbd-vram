@@ -20,7 +20,7 @@ echo "=== building ==="
 make
 
 echo "=== starting nbd-vram daemon ==="
-./nbd-vram &
+./nbd-vram > /tmp/nbd-vram.log 2>&1 &
 NBD_PID=$!
 echo "PID: $NBD_PID"
 
@@ -42,7 +42,9 @@ done
 [ -n "$NBD_DEV" ] || { echo "no free nbd device" >&2; kill $NBD_PID; exit 1; }
 echo "using $NBD_DEV"
 echo "$NBD_DEV" > /run/nbd-vram-dev
-nbd-client -unix /run/nbd-vram.sock "$NBD_DEV"
+# note experimenting with more connections here; otherwise it uses just one 
+# which could trip up the kernel in low memory situations
+nbd-client -unix /run/nbd-vram.sock "$NBD_DEV" -connections 4
 
 echo ""
 echo "=== write/read test (1 MiB at offset 0) ==="
@@ -61,7 +63,7 @@ rm -f /tmp/vram-test-in /tmp/vram-test-out
 echo ""
 echo "=== activating swap ==="
 mkswap "$NBD_DEV"
-swapon "$NBD_DEV" -p "${VRAM_SWAP_PRIORITY:-1500}"
+swapon "$NBD_DEV" -p "${VRAM_SWAP_PRIORITY:-1500}" --discard=pages
 
 echo ""
 swapon --show
