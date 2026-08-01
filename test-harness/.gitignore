@@ -1,0 +1,7 @@
+# build artifacts and per-run state
+libcuda.so.1
+nbd-vram
+nbd-vram-tsan
+*.log
+*.sock
+__pycache__/
