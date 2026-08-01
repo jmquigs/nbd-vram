@@ -34,7 +34,11 @@ echo "nbd-vram-connect: using $NBD_DEV"
 nbd-client -d "$NBD_DEV" 2>/dev/null || true
 nbd-client -unix /run/nbd-vram.sock "$NBD_DEV" -connections ${VRAM_NBD_CONNECTIONS:-4}
 mkswap "$NBD_DEV"
-swapon "$NBD_DEV" -p "${VRAM_SWAP_PRIORITY:-1500}"
+# --discard=pages returns freed swap slots to the daemon as TRIMs, which is what
+# releases their VRAM. Without it the compressed store only ever grows, and an
+# overcommitted device fills far sooner than it needs to.
+swapon "$NBD_DEV" -p "${VRAM_SWAP_PRIORITY:-1500}" --discard=pages 2>/dev/null \
+    || swapon "$NBD_DEV" -p "${VRAM_SWAP_PRIORITY:-1500}"
 
 # Save device name so disconnect script knows what to clean up
 echo "$NBD_DEV" > /run/nbd-vram-dev

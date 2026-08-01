@@ -14,7 +14,9 @@ Tested on: AMD/ATI + RTX 3070 Laptop (GA104M, 16 GB RAM, 8 GB VRAM), driver 580.
 
 A small daemon allocates VRAM via the CUDA driver API, then serves it as a block device using the NBD (Network Block Device) protocol over a Unix socket. The kernel's built-in `nbd` driver connects to it and exposes `/dev/nbdX`. From there it's a normal swap device.
 
-Data path: kernel swap subsystem - /dev/nbdX - nbd kernel driver - Unix socket - nbd-vram daemon - cuMemcpyHtoD/DtoH - GPU VRAM.
+Data path: kernel swap subsystem - /dev/nbdX - nbd kernel driver - Unix socket - nbd-vram daemon - zstd - cuMemcpyHtoD/DtoH - GPU VRAM.
+
+Pages are compressed before they cross PCIe, so the swap device is larger than the VRAM behind it - see [Compression](#compression).
 
 No kernel module to write or maintain. No NVIDIA kernel symbols. Survives kernel and driver updates without rebuilding anything.
 
@@ -46,10 +48,50 @@ The NBD approach sidesteps all of this. `cuMemcpyHtoD` and `cuMemcpyDtoH` work o
 
 ---
 
+## Compression
+
+Swap pages compress well, which is the whole premise of zram. NBD-VRAM does the same thing one level down: every 4 KiB page is compressed with zstd before the PCIe copy and decompressed on the way back, so a given amount of VRAM backs two to three times as much swap - and moves fewer bytes over the bus while doing it.
+
+Because of that, two sizes matter and they are set separately:
+
+| Setting | Meaning |
+|---|---|
+| `VRAM_SETUP_SIZE_MB` | how much **physical VRAM** to allocate (unchanged) |
+| `VRAM_DISK_SIZE_MB` | how big a **swap device** the kernel sees |
+
+The default is 7168 MiB of VRAM presented as a 14336 MiB device - a conservative 2x against the ~2.5-3x zstd level 1 usually manages on anonymous pages. If you leave `VRAM_DISK_SIZE_MB` unset the daemon simply doubles whatever VRAM it managed to grab.
+
+The daemon logs what it is actually achieving once a minute, so you can tune the ratio from your own workload rather than guessing:
+
+```
+# journalctl -u vram-swap-nbd -f
+[nbd-vram] stats: stored 5.20 GiB -> 1.83 GiB on device (2.84x) | heap 1.91 GiB/7.00 GiB committed (27.3%) | slack 2.4% | raw 0.9% | enospc 0 retries 0
+```
+
+`stored` is what the kernel has put on the device, `on device` is the VRAM it actually occupies, and the multiplier between them is the live compression ratio. `slack` is the cost of rounding each compressed page up to a 64-byte allocation class, `raw` is the share of pages the compressor could not shrink at all, and `enospc` counts writes refused for want of VRAM.
+
+**What happens if you set it too high.** Nothing is corrupted and nothing is lost: once the VRAM is full the daemon returns `ENOSPC` for further writes, the kernel logs `Write-error on swap-device`, keeps that page in RAM, and falls through to the next swap device in priority order. The connection stays up and everything already stored stays readable. You will see it coming in the journal - the daemon warns at 90%, 95% and 99% before it happens.
+
+Two knobs if the default is not what you want:
+
+```ini
+Environment=VRAM_COMPRESS=zstd        # zstd | lz4 | none
+Environment=VRAM_COMPRESS_LEVEL=1     # zstd level
+```
+
+`lz4` compresses roughly four times faster for about 30% less capacity - worth it if you care more about sustained throughput than about how much swap you get. `none` turns compression off entirely and clamps the device back to the size of the VRAM, which is how the daemon behaved before this existed.
+
+Both libraries are loaded with `dlopen` at runtime, exactly like `libcuda.so.1`, so there is nothing new to build against and no new package to install. If neither is present the daemon still runs, uncompressed.
+
+**Freed swap is returned to you.** The device advertises discard, and `nbd-vram-connect.sh` passes `--discard=pages` to `swapon`, so when the kernel frees a swap slot the daemon frees the VRAM behind it. This is the main thing keeping an overcommitted device from filling up over time.
+
+---
+
 ## Requirements
 
 - NVIDIA GPU with CUDA support (any consumer RTX/GTX card)
 - NVIDIA driver with `libcuda.so.1` (no CUDA toolkit needed)
+- `libzstd1` or `liblz4-1` for compression - both are systemd dependencies on Debian/Ubuntu, so they are already installed; without either, the daemon runs uncompressed
 - Linux kernel 5.6+ recommended, since that is where `PR_SET_IO_FLUSHER` landed and the swap-deadlock protection leans on it, though older kernels still run with that one safeguard disabled (the `nbd` module itself is built into most distros)
 - `nbd-client` package
 - `gcc`, `make`
@@ -82,13 +124,19 @@ The service is enabled on install, so it comes up automatically on every boot.
 Edit `/etc/systemd/system/vram-swap-nbd.service`:
 
 ```ini
-Environment=VRAM_SETUP_SIZE_MB=7168    # how much VRAM to use
+Environment=VRAM_SETUP_SIZE_MB=7168    # how much physical VRAM to use
+Environment=VRAM_DISK_SIZE_MB=14336    # swap device size the kernel sees (see Compression)
+Environment=VRAM_COMPRESS=zstd         # zstd | lz4 | none
+Environment=VRAM_COMPRESS_LEVEL=1      # zstd level
+Environment=VRAM_STATS_INTERVAL_SEC=60 # ratio logging interval; 0 disables
 Environment=VRAM_SWAP_PRIORITY=1500    # swap priority (higher = used first)
 Environment=VRAM_NBD_THREADS=8         # worker threads; install.sh sets this to nproc
 Environment=VRAM_NBD_CONNECTIONS=8     # nbd connections; keep equal to threads
 ```
 
 The daemon tries the requested size first and backs off in 512 MiB steps if the GPU is short on memory - so it will grab as much as it can even if the display compositor is already loaded. `VRAM_SETUP_SIZE_MB` is the ceiling, not a hard requirement.
+
+`VRAM_DISK_SIZE_MB` is independent of that backoff, so if the daemon ends up with less VRAM than asked the effective overcommit rises. It logs both numbers and the ratio between them at startup.
 
 `VRAM_NBD_THREADS` / `VRAM_NBD_CONNECTIONS` are auto-set to `nproc` at install and should match each other. More connections let the daemon drain concurrent swap I/O in parallel; the benefit saturates around your physical core count, and single-stream workloads do not use it at all (see Performance).
 
@@ -152,6 +200,10 @@ The daemon backs a swap device, which creates two subtle deadlock risks under he
 
 2. While serving a swap write the daemon still needs to allocate memory, and at zero free RAM that allocation would normally trigger reclaim - which is itself waiting on the very write the daemon is doing. The daemon marks itself with `prctl(PR_SET_IO_FLUSHER)` (the same mechanism the kernel uses for the nbd socket, and what NFS-Ganesha and libfuse use) so its allocations never fall into that trap. It also runs with `OOMScoreAdjust=-1000`, so the kernel never kills it under pressure.
 
+3. Better still, the I/O path does not allocate at all. Compression needs somewhere to put its working state, and the obvious way to get it - letting the library allocate per call - would put a `malloc` inside every swap write, which is exactly what point 2 is about. Instead the block index, the allocator bitmap, the staging buffers and the compression workspaces are all sized, allocated and written at startup, before any client connects. zstd's contexts go in that arena via `ZSTD_initStaticCCtx`, so the guarantee is structural rather than a hope that the library keeps reusing its buffers.
+
+The bookkeeping for the compressed store costs about 40 MiB of resident RAM at the default 7 GiB / 14 GiB configuration: roughly 28 MiB of block index (8 bytes per 4 KiB block, scaling with `VRAM_DISK_SIZE_MB`) plus 14 MiB of allocator bitmap. That is the price of turning 7 GiB of VRAM into ~14 GiB of swap, and the daemon prints it at startup.
+
 The daemon is multi-threaded - one worker and one connection per CPU - so it keeps up with concurrent swap traffic instead of saturating and stalling the system.
 
 ---
@@ -161,6 +213,11 @@ The daemon is multi-threaded - one worker and one connection per CPU - so it kee
 Tested on RTX 3070 Laptop (8 GB VRAM), Ryzen 9 5900HX, kernel 6.17, Pop!_OS, against NVMe cryptswap (dm-crypt, PCIe 4.0). O_DIRECT. Each test was run 3 times; the numbers and the gif for each are from a representative (median) run.
 
 NBD-VRAM turns otherwise-idle VRAM into a fast, zero-wear tier of swap. Its strengths are the ones that matter for everyday use: microsecond latency for the sporadic page faults that make a machine feel laggy, no SSD wear, and stable behaviour under heavy pressure. It sits above your SSD swap in priority, so it absorbs pressure first - for free.
+
+The numbers below predate compression and were measured against a device that could never fill. Two things changed since:
+
+- **Single-stream sequential writes are now bounded by one core's compression rate** rather than by PCIe, so the sequential write figure drops (roughly 0.5 GB/s with zstd level 1, ~1.5 GB/s with lz4). Aggregate throughput across connections is unaffected, and the concurrent and latency cases - the ones swap actually exercises - are within a few percent, since ~8 us of compression sits inside a ~250 us fault.
+- **Benchmarks that write incompressible data across the whole device will now hit I/O errors partway through**, because fio fills its buffers with random data by default and the device is overcommitted. That is the `ENOSPC` behaviour described under [Compression](#compression) working as intended, not a failure. Bound the write span below the physical VRAM size, or pass fio `--buffer_compress_percentage` so the data resembles real swap pages.
 
 Run any of these yourself (state is restored on exit; `fio`/`ioping` auto-install):
 

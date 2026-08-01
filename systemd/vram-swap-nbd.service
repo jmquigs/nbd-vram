@@ -17,6 +17,21 @@ Environment=VRAM_SWAP_PRIORITY=1500
 Environment=VRAM_NBD_THREADS=4
 Environment=VRAM_NBD_CONNECTIONS=4
 
+# Size of the swap device the kernel sees. Pages are compressed before they
+# cross PCIe, so this is larger than the VRAM behind it - the same trade zram
+# makes. 2x is conservative against the ~2.5-3x zstd typically gets on anonymous
+# pages; the daemon logs the ratio it is actually achieving once a minute, so
+# tune this from your own workload. Set it too high and the device does not
+# corrupt anything, it just starts refusing writes with ENOSPC once the VRAM is
+# full, and the kernel falls through to the next swap device.
+Environment=VRAM_DISK_SIZE_MB=14336
+# zstd | lz4 | none. zstd level 1 is the ratio/speed knee for 4 KiB pages;
+# lz4 is ~4x faster to compress for ~30% less capacity.
+Environment=VRAM_COMPRESS=zstd
+Environment=VRAM_COMPRESS_LEVEL=1
+# Seconds between compression-ratio log lines. 0 disables them.
+Environment=VRAM_STATS_INTERVAL_SEC=60
+
 # Wake GPU before CUDA init to avoid GSP RPC timeout (Xid 119 on laptops)
 ExecStartPre=/usr/bin/nvidia-smi -pm 1
 # Swap aggressively before RAM fills so the kernel never runs out of memory
