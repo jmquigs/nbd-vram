@@ -19,10 +19,16 @@ rm -f /run/nbd-vram.sock /run/nbd-vram-dev
 echo "=== building ==="
 make
 
+if [ -f /tmp/nbd-vram.log ]; then 
+    mv -f /tmp/nbd-vram.log /tmp/nbd-vram.log.old
+fi
+
 echo "=== starting nbd-vram daemon ==="
 ./nbd-vram > /tmp/nbd-vram.log 2>&1 &
 NBD_PID=$!
 echo "PID: $NBD_PID"
+
+sudo choom -n -1000 -p "$NBD_PID"
 
 echo "=== waiting for socket ==="
 for i in $(seq 1 60); do
