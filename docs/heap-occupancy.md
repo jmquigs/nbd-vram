@@ -1,11 +1,19 @@
 # Heap occupancy: reporting, allocation policy, and compaction
 
-Status: design notes, nothing implemented yet.
-Baseline: `nbd-vram.c` as of `develop` (`842d4df`).
+Status: §3 and §4 are implemented; §5 remains deferred.
+Baseline: `nbd-vram.c` as of `develop` (`842d4df`). The measurements in §1 and
+every line number quoted below are against that revision, not against the
+implemented result — the "as implemented" subsections describe what changed.
 
 This describes two changes worth making now (§3, §4) and one larger one deferred
 (§5). It is written to be read cold, so §1 and §2 record the measurements that
 motivate all three.
+
+**Read §4.1 before trusting §4.** The allocation-policy change was implemented as
+designed and measured against its own baseline, and it did not move occupancy.
+The reasoning in §2 about *why* extents do not drain holds up; the conclusion
+that a placement heuristic can fix it does not. That result changes what §5 is
+for, so it is recorded rather than quietly dropped.
 
 ---
 
@@ -130,7 +138,7 @@ delivering 0.98x end-to-end.
 
 ---
 
-## 3. Change 1 — report occupancy
+## 3. Change 1 — report occupancy *(implemented)*
 
 Cheapest change here and the highest information gain. The current line reports
 `stored/slots` as its headline ratio, which is not the quantity that governs
@@ -156,36 +164,59 @@ already tracked.
    `g_extents_used`. The high-water mark is one new `unsigned long` updated in
    `slot_alloc` under `g_alloc_mu`, which is already held.
 
-Target shape:
-
-```
-[nbd-vram] stats: stored 2.63 GiB -> 2.68 GiB VRAM (0.98x) | codec 3.62x
-  | occupancy 27.6% | extents 2745/3072 (peak 2745)
-  | heap 2.68/3.00 GiB (89.3%) | slack 2.7% | raw 1.3%
-  | enospc 0 trimmed 2717220 retries 0
-```
-
 5. **Warn on the fragmentation signature, not just on fullness.** The existing
    warning fires on `committed` percentage alone, which cannot distinguish "full
    of data" from "full of holes". Add a second condition — roughly
    `committed >= 75% && occupancy < 50%` — with the same hysteresis treatment as
    the existing one, and wording that names fragmentation as the cause.
 
+6. **A second line describing the bins from §4**, printed on the same tick as
+   the stats line. Where the occupancy figure says how bad the fragmentation is,
+   this says what shape it has.
+
+### As implemented
+
+Two lines, each still one physical line, printed together by `stats_worker`:
+
+```
+[nbd-vram] stats: stored 2.00 GiB -> 87.0 MiB VRAM (23.54x) | codec 30.19x | occupancy 96.5% | extents 87/1024 (peak 87) | heap 87.0 MiB/1.00 GiB committed (8.5%) | slack 19.2% | raw 0.0% | enospc 0 trimmed 0 retries 0
+[nbd-vram] stats bins: 87 used = 82 full + 5 partial | free 937 | classes 5 | partial by fullness: 75-100% 1 | 50-75% 1 | 25-50% 1 | 0-25% 2
+```
+
+(From the harness, not the field: the synthetic data compresses far better than
+real anonymous memory.)
+
+The bins line reports extent populations rather than bytes, and `classes` counts
+size classes holding at least one partial extent. That last figure is there for
+§2.1: holes are class-specific, so free space spread over 50 classes is much
+weaker protection against ENOSPC than the same free space in five.
+
+The fragmentation warning fires at `committed >= 75% && occupancy < 50%` and
+clears at `committed < 65% || occupancy >= 60%`, mirroring the fullness warning's
+hysteresis.
+
 ### Notes
 
-- `hsize()` renders into caller-supplied buffers; the target line needs more
-  than the current four, so bump the array.
-- Keep the line to one physical line. It is grepped and tailed.
-- The ratios are already guarded against divide-by-zero; `commit` needs the same
-  guard, as it is zero before the first allocation.
+- The `used`/`free` extent counts became `used`/`total` in the line, since the
+  free count is on the bins line and `total` is what makes the ratio readable.
+- `hsize()` did **not** need more buffers: rendering `commit` twice needs two
+  buffers rather than one, but dropping the separate slot-bytes figure (it is
+  `occupancy × committed`) freed one, so four still does.
+- The high-water mark `g_extents_peak` is a `uint32_t` matching
+  `g_extents_used`, not the `unsigned long` sketched above, and is updated in
+  `slot_alloc` under `g_alloc_mu` on the fresh-extent path only — the only place
+  `g_extents_used` grows.
+- `commit` is guarded against divide-by-zero along with the other ratios.
+- `stats bins:` deliberately does not contain the string `stats:`, so existing
+  `grep stats:` invocations still match exactly one line per tick.
 
 ---
 
-## 4. Change 2 — allocation policy
+## 4. Change 2 — allocation policy *(implemented; see §4.1 for the result)*
 
-Fixes the generational mixing described in §2. This is prevention, not cure: it
-stops occupancy from collapsing, but it cannot recover extents that are already
-fragmented. That is §5.
+Intended to fix the generational mixing described in §2. This is prevention, not
+cure: it stops occupancy from collapsing, but it cannot recover extents that are
+already fragmented. That is §5.
 
 ### Scope
 
@@ -214,14 +245,6 @@ Cost: `NCLASS × NBINS × 4` bytes = 1 KiB of new bookkeeping. This matters —
 `nbd-vram.c:810-813` records that allocator memory comes out of the RAM the
 daemon exists to conserve, and that constraint should not be relaxed casually.
 
-### Cheaper variant, if an A/B is wanted first
-
-Adding `g_class_tail[NCLASS]` and pushing full→partial extents to the tail rather
-than the head is a ~5-line change that captures part of the benefit: freshly
-freed extents go to the back of the queue and get time to drain. It is strictly
-weaker than binning — pure FIFO will still refill a nearly-empty extent once it
-reaches the front — but it is a useful control when measuring.
-
 ### Interaction with locality
 
 Preferring the fullest extent naturally means "keep filling the one you are
@@ -229,23 +252,111 @@ already filling", which also preserves the temporal locality the kernel handed
 us (§2). The two goals point the same direction here; no separate mechanism
 needed.
 
-### Success criterion
+### As implemented
 
-Occupancy after a fill/drain/refill cycle, measured by §3. Baseline is 27.6%.
-Anything above ~70% would mean the mixing is fixed. Watch `slack` at the same
-time — binning should not move it, and if it does something is wrong with the
-bin-to-class mapping.
+`g_class_head[NCLASS]` became `g_class_bin[NCLASS][NBINS]` with `NBINS` 4, plus
+`g_bin_extents[NBINS]` for the stats line. The bin index is derived from
+`nfree`/`nslots` on demand rather than cached in the extent, so there is no new
+per-extent state to keep in sync and `struct extent` is unchanged at 16 bytes;
+callers read `ext_bin()` before mutating `nfree` and hand the result to
+`ext_rebin()` afterwards. Total new memory is the 1 KiB predicted.
+
+Setting `NBINS` to 1 reproduces the old single-list behaviour exactly — every
+partial extent bins to 0, and the full↔partial transitions become the original
+head push and head removal. That is how the A/B below was run, so both sides
+shared identical stats code.
+
+---
+
+## 4.1 What it actually did: nothing measurable
+
+`test-harness/run.sh --fragment` (new, see `test-harness/fragment.py`) runs
+rolling generations of 2 MiB clusters — written together, trimmed together,
+lifetimes overlapping — and reads back the occupancy from §3. Occupancy after the
+final drain, same workload, same seed, three placement policies:
+
+| Policy | Default workload (51 classes) | Concentrated (8 classes) |
+|---|---|---|
+| Single partial list per class (the old behaviour) | 64.9% | 81.4% |
+| Fullest bin first (this change) | 62.4% | 81.4% |
+| Emptiest bin first (the inverse) | 62.6% | 81.7% |
+
+Three policies, one of them the deliberate inverse of the other, land within two
+points of each other, and on the concentrated workload two of them are identical
+to the digit. Committed extents receded from their peak by the same handful in
+every run. Whatever governs occupancy here, it is not which partial extent gets
+topped off.
+
+### Why
+
+1. **Placement never gets to choose "neither".** `slot_alloc` commits a fresh
+   extent only when its class has *no* partial extent at all. So while any hole
+   exists in the class, every new block goes into one. The policy picks which
+   extent gets contaminated by a foreign generation; it cannot decline to
+   contaminate one.
+
+2. **Per cycle, allocations ≈ holes.** A steady working set frees about as many
+   slots per cycle as the next generation needs. Every partial extent in a class
+   is therefore visited over a cycle whatever the order, and a single foreign
+   block is enough to keep an extent off the free list.
+
+3. **Fullest-first *is* the old behaviour, for the extents that matter.** §2's
+   complaint was that an extent going full→partial is pushed to the head and
+   becomes the next allocation target. An extent that has just lost one slot is
+   by definition ≥75% full, so it lands in bin 0 and is the next allocation
+   target. Binning only diverges from the old policy once an extent has lost a
+   quarter of its slots — by which point it has already been re-contaminated.
+
+Point 3 is the one that should have been caught at design time: the mechanism in
+§2 was correctly identified and the proposed fix does not disturb it.
+
+### What this does not overturn
+
+- §2's diagnosis. Extents still fail to drain because they hold blocks from
+  several generations; that is visible directly in the bins line, where partial
+  extents spread broadly across all four buckets instead of piling into the
+  full and empty ends.
+- §1.2 and §5. Nothing here recovers stranded space; it never claimed to.
+
+### Kept anyway
+
+The change is retained rather than reverted, for reasons that are worth being
+explicit about since it did not deliver what it promised:
+
+- The bins line (§3) is the only view of heap shape there is, and it needs the
+  bins to exist.
+- Fullest-first is a sound default independent of drainage: it finishes extents
+  off instead of leaving a spread of half-used ones, which is what keeps the
+  larger-class fallback in §2.1 from being reached prematurely.
+- It costs 1 KiB and a comparison per allocation, both measured as noise.
+- §5 needs a way to say "allocate, but not into a fresh extent"; a class's bins
+  are exactly the structure that makes that expressible.
+
+If a future change wants the list machinery gone, the honest summary is that it
+buys visibility and costs nothing, not that it fixed fragmentation.
+
+### Success criterion, revised
+
+The original criterion — occupancy above ~70% after fill/drain/refill, against a
+27.6% baseline — was not met and is not reachable by this change. `--fragment`
+now asserts a regression *floor* (55%) rather than a target, and prints the
+number for comparison. `slack` was checked as planned and did not move: 1.5% on
+both sides of the A/B, so the bin-to-class mapping is sound.
 
 ---
 
 ## 5. Future work — compaction
 
 Deferred, but it is the load-bearing fix and the other two changes should be
-read as preparation for it.
+read as preparation for it. §4.1 raises its priority rather than lowering it:
+with the allocation-policy lever measured and found inert, compaction is no
+longer the more thorough of two options, it is the only one left that addresses
+stranded space.
 
 ### Why it is not optional
 
-No allocation policy recovers an already-fragmented heap. At 27.6% occupancy,
+No allocation policy recovers an already-fragmented heap — and, per §4.1, no
+allocation policy measurably prevents one either. At 27.6% occupancy,
 1.94 GiB is stranded inside committed extents and only *moving blocks* frees it.
 Concretely, from the measurements in §1:
 
@@ -308,7 +419,11 @@ rather than failing startup.
 **Compaction must not raise `committed`.** Step 1 has to allocate from an
 existing partial extent; if it is allowed to commit a fresh extent, a compaction
 pass can transiently increase the very number it exists to reduce. Either
-restrict the allocation or accept and bound the transient.
+restrict the allocation or accept and bound the transient. The bins from §4 make
+the restriction cheap to express: a `slot_alloc` variant that consults
+`class_pick` and returns `SLOT_NONE` instead of falling through to `g_free_head`
+is a few lines, and taking from bin 0 first is the right target for relocated
+blocks anyway.
 
 **Throttling and triggering.** A sweep burns PCIe bandwidth, VRAM bandwidth and
 the alloc mutex, all of which are on the swap path. It should run from the
@@ -317,25 +432,70 @@ per second, and trigger on the occupancy signal from §3 rather than on a timer 
 something like "occupancy < 50% and committed > 60%", stopping once occupancy
 recovers.
 
+**Occupancy under-reports the problem when §1.1 blocks are present.** This came
+out of modelling undiscarded frees in the harness (`FRAG_STALE_PCT`) and it is
+not obvious: stale blocks *raise* occupancy. The daemon cannot tell them from
+live ones, so they count in `g_slot_bytes` — a heap that is 60% full of data
+nobody will ever read again reports 60% occupancy and looks healthy. The failure
+in §1 was visible only because the peak had committed so many extents that even
+the stale blocks could not fill them.
+
+Two consequences for the trigger. First, an occupancy threshold will not fire on
+the heap that most needs help, so pair it with something that notices the
+divergence — `committed` sitting near its high-water mark while `trimmed` climbs
+is the signature. Second, compaction will faithfully relocate stale blocks,
+spending PCIe bandwidth to preserve data the kernel freed long ago. That is
+correct behaviour and unavoidable from inside the daemon, but it means the
+bandwidth budget should be sized against `stored`, not against the fraction of
+`stored` that is useful.
+
+### A second lever, if compaction stays deferred
+
+§4.1 rules out *choosing between* partial extents. It says nothing about
+declining to use one. Committing a fresh extent while partials remain — bounded
+by free-extent headroom, so it degrades to current behaviour as the heap fills —
+would let a generation land in extents of its own and drain as a unit, which is
+the thing the current allocator structurally cannot do (§4.1, point 1). It
+trades committed VRAM up front for extents that can actually be released later,
+so it is only worth having if something eventually collects them, which is
+compaction again. Worth measuring with `--fragment` before it is worth
+designing: the harness makes it a one-line experiment.
+
 ---
 
 ## 6. Validation
 
-To be wired to the test harness once that lands. The metrics that matter, all
-exposed by §3:
+Wired to the host-side harness as `test-harness/run.sh --fragment`, which drives
+rolling generations of 2 MiB clusters over the NBD socket and reads the numbers
+back out of the §3 stats line. It also re-reads live and trimmed clusters, which
+is a genuine check on the bin list surgery — a botched relink hands out a slot
+that is already in use, and the symptom is one block reading back as another.
+`SRC=... ./run.sh --fragment` builds a different source file, which is how the
+§4.1 A/B was run.
 
-| Metric | Baseline | Target |
-|---|---|---|
-| Occupancy after fill/drain/refill | 27.6% | > 70% |
-| Effective ratio (`stored/committed`) | 0.98x | > 2.67x (the configured 8192/3072) |
-| `committed` high-water after a drain | 2.68 GiB | recedes |
-| `slack` | 2.7% | unchanged |
-| `retries` | 0 | non-zero under compaction, but bounded |
+The metrics that matter, all exposed by §3:
 
-The shape of the test that produced the numbers in §1: fill swap with large
-processes, drain, repeat several times, then exit everything and read the final
-stats line. Occupancy after the final drain is the headline number — it is where
-the failure is most visible and where a fix will show up first.
+| Metric | Field baseline | Harness | Target |
+|---|---|---|---|
+| Occupancy after fill/drain/refill | 27.6% | 62-66%, policy-independent | > 70% |
+| Effective ratio (`stored/committed`) | 0.98x | 1.2x | > 2.67x (the configured 8192/3072) |
+| `committed` high-water after a drain | 2.68 GiB | 321 → 305-317 extents | recedes |
+| `slack` | 2.7% | 1.5%, unchanged across policies | unchanged |
+| `retries` | 0 | 0 | non-zero under compaction, but bounded |
+
+**The harness does not reproduce the field failure.** No configuration tried gets
+occupancy below ~60%, against 27.6% observed in the field. The workload holds a
+flat working set, so `committed` never builds the high-water mark that the
+collapse is measured against; reproducing it needs a large peak followed by a
+scattered drain. Until that exists, a green `--fragment` run means "placement did
+not regress", not "fragmentation is handled". Compaction will need real-hardware
+validation regardless — the stub models neither DtoD copies nor their cost.
+
+The shape of the test that produced the numbers in §1, still the reference:
+fill swap with large processes, drain, repeat several times, then exit everything
+and read the final stats line. Occupancy after the final drain is the headline
+number — it is where the failure is most visible and where a fix will show up
+first.
 
 An additional check worth having: force a refill after the drain and confirm
 `stored` grows more slowly than kernel swap usage, which is the signature of

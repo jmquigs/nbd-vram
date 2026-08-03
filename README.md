@@ -65,10 +65,15 @@ The daemon logs what it is actually achieving once a minute, so you can tune the
 
 ```
 # journalctl -u vram-swap-nbd -f
-[nbd-vram] stats: stored 5.20 GiB -> 1.83 GiB on device (2.84x) | heap 1.91 GiB/7.00 GiB committed (27.3%) | slack 2.4% | raw 0.9% | enospc 0 retries 0
+[nbd-vram] stats: stored 5.20 GiB -> 1.91 GiB VRAM (2.72x) | codec 2.84x | occupancy 98.2% | extents 1956/7168 (peak 2011) | heap 1.91 GiB/7.00 GiB committed (27.3%) | slack 2.4% | raw 0.9% | enospc 0 trimmed 1204331 retries 0
+[nbd-vram] stats bins: 1956 used = 1904 full + 52 partial | free 5212 | classes 44 | partial by fullness: 75-100% 31 | 50-75% 12 | 25-50% 6 | 0-25% 3
 ```
 
-`stored` is what the kernel has put on the device, `on device` is the VRAM it actually occupies, and the multiplier between them is the live compression ratio. `slack` is the cost of rounding each compressed page up to a 64-byte allocation class, `raw` is the share of pages the compressor could not shrink at all, and `enospc` counts writes refused for want of VRAM.
+`stored` is what the kernel has put on the device and `VRAM` is what that actually costs, so the multiplier between them is the ratio to size against - it is the one that decides when writes start failing. `codec` is what the compressor earns before the allocator rounds anything up; the two diverge as the heap fragments.
+
+`occupancy` is how much of the committed VRAM is holding data rather than holes. VRAM is committed in 1 MiB extents and an extent is only released once every slot in it is free, so a heap can be 90% committed and half empty after a large process exits - the daemon warns about exactly that pattern, because freeing more swap will not bring the committed figure down. `slack` is the cost of rounding each compressed page up to a 64-byte allocation class, `raw` is the share of pages the compressor could not shrink at all, and `enospc` counts writes refused for want of VRAM.
+
+The second line breaks the partial extents down by how full they are; a long tail in the low buckets alongside a large `full` count is fragmentation accumulating.
 
 **What happens if you set it too high.** Nothing is corrupted and nothing is lost: once the VRAM is full the daemon returns `ENOSPC` for further writes, the kernel logs `Write-error on swap-device`, keeps that page in RAM, and falls through to the next swap device in priority order. The connection stays up and everything already stored stays readable. You will see it coming in the journal - the daemon warns at 90%, 95% and 99% before it happens.
 

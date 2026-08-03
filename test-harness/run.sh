@@ -9,12 +9,16 @@
 #   ./run.sh --codec lz4           ... against a different codec (zstd|lz4|none)
 #   ./run.sh --capacity random     fill the device; incompressible data hits ENOSPC
 #   ./run.sh --capacity compressible
+#   ./run.sh --fragment            fill/drain/refill cycles; measures occupancy
 #   ./run.sh --tsan                functional suite under ThreadSanitizer
 #   ./run.sh --all                 everything above, in sequence
+#
+# SRC=/path/to/other.c ./run.sh --fragment  builds a different source, for A/B
+# measurement of an allocator change against its own baseline.
 set -u
 
 cd "$(dirname "$0")"
-SRC=../nbd-vram.c
+SRC=${SRC:-../nbd-vram.c}
 SOCK=$PWD/t.sock
 
 # The daemon's allocation loop is `while (mb >= 1024)`, so anything below 1024
@@ -31,6 +35,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --codec)    CODEC="$2"; shift 2 ;;
         --capacity) MODE=capacity; FILL="${2:-compressible}"; shift 2 ;;
+        --fragment) MODE=fragment; shift ;;
         --tsan)     TSAN=1; shift ;;
         --all)      MODE=all; shift ;;
         -h|--help)  sed -n '2,14p' "$0"; exit 0 ;;
@@ -86,21 +91,33 @@ run_functional() {
 
 run_capacity() {
     echo "=== capacity: $1 data (codec=$CODEC) ==="
-    start_daemon 5 || return 1
+    start_daemon "${FRAG_STATS_SEC:-5}" || return 1
     python3 -u capacity.py "$SOCK" "$1" || rc=1
     sleep 6   # let one stats line land
     grep -E "stats:|heap .*committed|full" daemon.log | tail -3
 }
 
+# fragment.py reads daemon.log to get the occupancy the daemon reports, so the
+# stats interval has to be short enough that a fresh line lands after the
+# workload rather than only at shutdown.
+run_fragment() {
+    echo "=== fragmentation: fill/drain/refill occupancy (codec=$CODEC) ==="
+    start_daemon "${FRAG_STATS_SEC:-5}" || return 1
+    python3 -u fragment.py "$SOCK" daemon.log || rc=1
+    grep -E "stats bins:" daemon.log | tail -1
+}
+
 case "$MODE" in
     functional) build || exit 1; run_functional "${TSAN:+tsan}" ;;
     capacity)   build || exit 1; run_capacity "$FILL" ;;
+    fragment)   build || exit 1; run_fragment ;;
     all)
         TSAN=0; build || exit 1
         for CODEC in zstd lz4 none; do run_functional; echo; done
         CODEC=zstd
         run_capacity compressible; echo
         run_capacity random; echo
+        run_fragment; echo
         TSAN=1; build || exit 1
         run_functional "ThreadSanitizer"
         ;;

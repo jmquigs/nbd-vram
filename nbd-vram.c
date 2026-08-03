@@ -826,6 +826,30 @@ static inline uint64_t idx_load(uint64_t blk)
 #define EXT_BMWORDS   (EXT_GRAINS / 64)              /* 256 words = 2 KiB per extent */
 #define EXT_NONE      0xFFFFFFFFu
 
+/* Partial extents are kept on per-class lists bucketed by how full they are, and
+ * allocation takes from the fullest non-empty bucket: a nearly-full extent gets
+ * topped off and retires from the lists, while a nearly-empty one is left alone
+ * so the trims still arriving for it can finish emptying it.
+ *
+ * Do not read more into that than it delivers. It was written to stop the
+ * generational mixing that collapsed heap occupancy to 27.6% in the field, and
+ * measured against a single-list build it did not move occupancy at all -
+ * neither did the exact inverse policy. Which partial extent gets topped off is
+ * not what decides whether extents ever drain, because a fresh extent is only
+ * committed when a class has no partial at all, so every new block lands in
+ * some existing extent's hole regardless. docs/heap-occupancy.md section 4.1
+ * has the numbers. What the bins are actually good for is the shape they give
+ * the stats line, and for finishing extents off rather than leaving a spread of
+ * half-used ones.
+ *
+ * Bin 0 is >= 75% full, bin NBINS-1 the emptiest; a full extent is on no list at
+ * all. Setting NBINS to 1 reproduces the old single-list behaviour exactly,
+ * which is how that A/B was run. Cost is NCLASS * NBINS * 4 = 1 KiB, which
+ * matters: allocator memory comes out of the RAM this daemon exists to
+ * conserve. */
+#define NBINS         4
+#define BIN_FULL      NBINS                          /* on no partial list */
+
 struct extent {
     uint32_t next, prev;   /* intrusive list: free list, or the class partial list */
     uint16_t nfree;
@@ -839,7 +863,9 @@ static struct extent  *g_ext;
 static uint64_t       *g_extbm;      /* n_extents * EXT_BMWORDS */
 static uint32_t        g_n_extents;
 static uint32_t        g_extents_used;
-static uint32_t        g_class_head[NCLASS];
+static uint32_t        g_extents_peak;               /* high-water mark of the above */
+static uint32_t        g_class_bin[NCLASS][NBINS];   /* partial lists, fullest bin first */
+static uint32_t        g_bin_extents[NBINS];         /* population of each bin, for stats */
 static uint32_t        g_free_head = EXT_NONE;
 static pthread_mutex_t g_alloc_mu;
 
@@ -860,6 +886,49 @@ static void lst_remove(uint32_t *head, uint32_t e)
     else                           *head = g_ext[e].next;
     if (g_ext[e].next != EXT_NONE) g_ext[g_ext[e].next].prev = g_ext[e].prev;
     g_ext[e].next = g_ext[e].prev = EXT_NONE;
+}
+
+/* Which partial list an extent belongs on, derived from its current occupancy so
+ * no per-extent state has to be kept in sync. Callers holding g_alloc_mu read it
+ * before mutating nfree and pass the result to ext_rebin() afterwards. */
+static inline uint32_t ext_bin(const struct extent *e)
+{
+    if (e->nfree == 0) return BIN_FULL;
+    uint32_t q = ((uint32_t)(e->nslots - e->nfree) * NBINS) / e->nslots;
+    if (q >= NBINS) q = NBINS - 1;   /* unreachable while nfree > 0; keeps the
+                                        index in range regardless */
+    return NBINS - 1 - q;
+}
+
+static void bin_link(uint32_t ei, uint32_t bin)
+{
+    lst_push(&g_class_bin[g_ext[ei].cls][bin], ei);
+    __atomic_fetch_add(&g_bin_extents[bin], 1, __ATOMIC_RELAXED);
+}
+
+static void bin_unlink(uint32_t ei, uint32_t bin)
+{
+    lst_remove(&g_class_bin[g_ext[ei].cls][bin], ei);
+    __atomic_fetch_sub(&g_bin_extents[bin], 1, __ATOMIC_RELAXED);
+}
+
+/* Settle an extent onto the right list after nfree changed. `from` is the bin it
+ * was on before the change, BIN_FULL if it was on none. Most allocations and
+ * frees do not cross a bin boundary, so the common path is one comparison. */
+static void ext_rebin(uint32_t ei, uint32_t from)
+{
+    uint32_t to = ext_bin(&g_ext[ei]);
+    if (to == from) return;
+    if (from != BIN_FULL) bin_unlink(ei, from);
+    if (to   != BIN_FULL) bin_link(ei, to);
+}
+
+/* The fullest partial extent of a class, or EXT_NONE if it has none. */
+static uint32_t class_pick(uint32_t cls)
+{
+    for (uint32_t b = 0; b < NBINS; b++)
+        if (g_class_bin[cls][b] != EXT_NONE) return g_class_bin[cls][b];
+    return EXT_NONE;
 }
 
 /* Hand a fresh extent to a size class. Slots that do not divide evenly into the
@@ -887,6 +956,7 @@ static uint32_t ext_take(uint32_t ei)
 {
     struct extent *e = &g_ext[ei];
     uint64_t *bm = g_extbm + (size_t)ei * EXT_BMWORDS;
+    uint32_t from = ext_bin(e);
 
     for (uint32_t i = 0; i < EXT_BMWORDS; i++) {
         uint32_t w = e->hint + i;
@@ -895,7 +965,8 @@ static uint32_t ext_take(uint32_t ei)
         int b = __builtin_ctzll(~bm[w]);
         bm[w] |= 1ULL << b;
         e->hint = (uint16_t)w;
-        if (--e->nfree == 0) lst_remove(&g_class_head[e->cls], ei);
+        e->nfree--;
+        ext_rebin(ei, from);
         uint32_t slot = w * 64 + (uint32_t)b;
         return ei * EXT_GRAINS + slot * (e->cls + 1u);
     }
@@ -911,20 +982,23 @@ static uint32_t slot_alloc(uint32_t nbytes, uint32_t *slot_bytes)
 
     pthread_mutex_lock(&g_alloc_mu);
 
-    ei = g_class_head[cls];
+    ei = class_pick(cls);
     if (ei == EXT_NONE && g_free_head != EXT_NONE) {
         ei = g_free_head;
         lst_remove(&g_free_head, ei);
         ext_init(ei, cls);
-        lst_push(&g_class_head[cls], ei);
-        __atomic_fetch_add(&g_extents_used, 1, __ATOMIC_RELAXED);
+        bin_link(ei, ext_bin(&g_ext[ei]));
+        uint32_t used = __atomic_add_fetch(&g_extents_used, 1, __ATOMIC_RELAXED);
+        if (used > ST_READ(g_extents_peak))
+            __atomic_store_n(&g_extents_peak, used, __ATOMIC_RELAXED);
     }
     /* No extent of our own class and no fresh one left: take a slot from a
      * larger class rather than fail while the heap still has room. Wasteful,
      * but "out of memory" is much more expensive than a rounded-up slot. */
     if (ei == EXT_NONE) {
         for (uint32_t c = cls + 1; c < NCLASS; c++) {
-            if (g_class_head[c] != EXT_NONE) { ei = g_class_head[c]; break; }
+            ei = class_pick(c);
+            if (ei != EXT_NONE) break;
         }
     }
     if (ei != EXT_NONE) {
@@ -953,13 +1027,15 @@ static uint32_t slot_free(uint32_t grain)
     uint64_t *bm  = g_extbm + (size_t)ei * EXT_BMWORDS;
     uint32_t sz   = (e->cls + 1u) * ALLOC_GRAIN;
 
+    uint32_t from = ext_bin(e);   /* BIN_FULL if this extent had no free slot */
+
     bm[slot / 64] &= ~(1ULL << (slot % 64));
-    if (e->nfree == 0) lst_push(&g_class_head[e->cls], ei);
     e->nfree++;
     if (slot / 64 < e->hint) e->hint = (uint16_t)(slot / 64);
+    ext_rebin(ei, from);
 
     if (e->nfree == e->nslots) {   /* fully empty: recycle for any class */
-        lst_remove(&g_class_head[e->cls], ei);
+        bin_unlink(ei, ext_bin(e));
         e->used = 0;
         lst_push(&g_free_head, ei);
         __atomic_fetch_sub(&g_extents_used, 1, __ATOMIC_RELAXED);
@@ -1011,7 +1087,9 @@ static int store_init(void)
         fprintf(stderr, "[nbd-vram] extent bookkeeping allocation failed\n");
         return -1;
     }
-    for (uint32_t c = 0; c < NCLASS; c++) g_class_head[c] = EXT_NONE;
+    for (uint32_t c = 0; c < NCLASS; c++)
+        for (uint32_t b = 0; b < NBINS; b++) g_class_bin[c][b] = EXT_NONE;
+    for (uint32_t b = 0; b < NBINS; b++) g_bin_extents[b] = 0;
     g_free_head = EXT_NONE;
     for (uint32_t i = g_n_extents; i-- > 0; ) {   /* build the list in ascending order */
         g_ext[i].next = g_ext[i].prev = EXT_NONE;
@@ -1952,8 +2030,22 @@ static const char *hsize(uint64_t b, char *buf, size_t n)
     return buf;
 }
 
+/* Occupancy: how much of the committed heap actually holds slots. This is the
+ * number that separates "full of data" from "full of holes", and the one the
+ * fragmentation warning keys off. */
+static double heap_occupancy(void)
+{
+    uint64_t commit = heap_committed();
+    return commit ? 100.0 * (double)ST_READ(g_slot_bytes) / (double)commit : 0.0;
+}
+
 /* The line the feature exists to produce: how much the kernel thinks it has
- * stored, how much VRAM that actually costs, and the ratio between them. */
+ * stored, how much VRAM that actually costs, and the ratio between them.
+ *
+ * The headline ratio is stored/committed, not stored/slots: committed VRAM is
+ * what runs out, and the two diverge by exactly the fragmentation. The codec
+ * ratio is kept alongside it because watching them separate is how the
+ * fragmentation becomes visible at all. */
 static void stats_log(const char *tag)
 {
     uint64_t blocks = ST_READ(g_blocks_live);
@@ -1963,12 +2055,16 @@ static void stats_log(const char *tag)
     uint64_t commit = heap_committed();
     char a[32], b[32], c[32], d[32];
 
-    printf("[nbd-vram] %s: stored %s -> %s on device (%.2fx) | heap %s/%s committed (%.1f%%) "
+    printf("[nbd-vram] %s: stored %s -> %s VRAM (%.2fx) | codec %.2fx | occupancy %.1f%% "
+           "| extents %u/%u (peak %u) | heap %s/%s committed (%.1f%%) "
            "| slack %.1f%% | raw %.1f%% | enospc %lu trimmed %lu retries %lu\n",
            tag,
            hsize(stored, a, sizeof(a)),
-           hsize(slots,  b, sizeof(b)),
-           slots  ? (double)stored / (double)slots : 0.0,
+           hsize(commit, b, sizeof(b)),
+           commit ? (double)stored / (double)commit : 0.0,
+           codec  ? (double)stored / (double)codec  : 0.0,
+           heap_occupancy(),
+           ST_READ(g_extents_used), g_n_extents, ST_READ(g_extents_peak),
            hsize(commit, c, sizeof(c)),
            hsize(g_vram_size, d, sizeof(d)),
            g_vram_size ? 100.0 * (double)commit / (double)g_vram_size : 0.0,
@@ -1978,11 +2074,48 @@ static void stats_log(const char *tag)
     fflush(stdout);
 }
 
+/* Second line: where the partial extents actually sit. A healthy heap keeps its
+ * partials in the fullest bin and few of them; a long tail in the emptiest bin
+ * with a large `full` count is fragmentation accumulating. `classes` is the
+ * count of size classes holding at least one partial extent - holes are
+ * class-specific, so a high number means the free space is scattered across
+ * classes that cannot lend to each other downwards. */
+static void bins_log(const char *tag)
+{
+    uint32_t used    = ST_READ(g_extents_used);
+    uint32_t partial = 0, classes = 0;
+    char buf[160];
+    int n = 0;
+
+    for (uint32_t b = 0; b < NBINS; b++) {
+        uint32_t lo = (NBINS - 1 - b) * 100 / NBINS;
+        uint32_t cnt = ST_READ(g_bin_extents[b]);
+        int w = snprintf(buf + n, sizeof(buf) - (size_t)n, "%s%u-%u%% %u",
+                         b ? " | " : "", lo, lo + 100 / NBINS, cnt);
+        partial += cnt;
+        if (w < 0 || (size_t)w >= sizeof(buf) - (size_t)n) break;
+        n += w;
+    }
+
+    for (uint32_t c = 0; c < NCLASS; c++)
+        for (uint32_t b = 0; b < NBINS; b++)
+            if (ST_READ(g_class_bin[c][b]) != EXT_NONE) { classes++; break; }
+
+    /* The counters are read without the lock and can disagree by an allocation
+     * or two, so the subtraction is clamped rather than trusted. */
+    printf("[nbd-vram] %s bins: %u used = %u full + %u partial | free %u | "
+           "classes %u | partial by fullness: %s\n",
+           tag, used, used > partial ? used - partial : 0, partial,
+           g_n_extents > used ? g_n_extents - used : 0, classes, buf);
+    fflush(stdout);
+}
+
 /* Ticks once a second so shutdown is prompt, but only reports on the interval. */
 static void *stats_worker(void *arg)
 {
     int tick = 0;
     int warned = 0;
+    int frag_warned = 0;
     (void)arg;
 
     while (g_running) {
@@ -2001,11 +2134,26 @@ static void *stats_worker(void *arg)
             warned = level;   /* hysteresis, so it can warn again after recovery */
         }
 
+        /* Fullness alone cannot tell "full of data" from "full of holes", and
+         * the second one is the failure mode that surprises people: the heap
+         * reaches ENOSPC while most of the committed VRAM is empty. */
+        int occ = (int)heap_occupancy();
+        if (!frag_warned && pct >= 75 && occ < 50) {
+            fprintf(stderr, "[nbd-vram] VRAM heap %d%% committed but only %d%% occupied - "
+                            "fragmentation, not data; committed VRAM cannot recede until "
+                            "extents empty completely\n", pct, occ);
+            frag_warned = 1;
+        } else if (frag_warned && (pct < 65 || occ >= 60)) {
+            frag_warned = 0;  /* hysteresis, matching the fullness warning above */
+        }
+
         if (++tick < g_stats_interval) continue;
         tick = 0;
         stats_log("stats");
+        bins_log("stats");
     }
     stats_log("final");
+    bins_log("final");
     return NULL;
 }
 
