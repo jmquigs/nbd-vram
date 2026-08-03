@@ -13,6 +13,6 @@ fi
 nbd-client -d "$NBD_DEV" 2>/dev/null || true
 rm -f /run/nbd-vram-dev
 
-sysctl -w vm.swappiness=60 vm.min_free_kbytes=131072 2>/dev/null || true
+sysctl -w vm.swappiness=100 vm.min_free_kbytes=131072 2>/dev/null || true
 
 echo "nbd-vram-disconnect: $NBD_DEV released"
