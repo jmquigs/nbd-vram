@@ -838,15 +838,21 @@ static inline uint64_t idx_load(uint64_t blk)
  * not what decides whether extents ever drain, because a fresh extent is only
  * committed when a class has no partial at all, so every new block lands in
  * some existing extent's hole regardless. docs/heap-occupancy.md section 4.1
- * has the numbers. What the bins are actually good for is the shape they give
- * the stats line, and for finishing extents off rather than leaving a spread of
- * half-used ones.
+ * has the numbers, and section 4.2 the field A/B that decides whether this
+ * stays at all - on the harness evidence alone it should not.
  *
  * Bin 0 is >= 75% full, bin NBINS-1 the emptiest; a full extent is on no list at
- * all. Setting NBINS to 1 reproduces the old single-list behaviour exactly,
- * which is how that A/B was run. Cost is NCLASS * NBINS * 4 = 1 KiB, which
- * matters: allocator memory comes out of the RAM this daemon exists to
- * conserve. */
+ * all. Cost is NCLASS * NBINS * 4 = 1 KiB, which matters: allocator memory comes
+ * out of the RAM this daemon exists to conserve.
+ *
+ * VRAM_ALLOC_BINS selects how many of those bins are actually used. 1 collapses
+ * every partial extent into one list and reproduces the old single-head
+ * behaviour exactly - full->partial pushes to the head, alloc takes the head -
+ * so the two policies can be compared on one binary against one workload, which
+ * is the only way to settle this on real swap. It is read once at startup and
+ * MUST NOT change afterwards: ext_rebin() unlinks using a bin index recomputed
+ * from the same divisor, so changing it under a populated heap would unlink
+ * extents from lists they are not on. */
 #define NBINS         4
 #define BIN_FULL      NBINS                          /* on no partial list */
 
@@ -866,6 +872,7 @@ static uint32_t        g_extents_used;
 static uint32_t        g_extents_peak;               /* high-water mark of the above */
 static uint32_t        g_class_bin[NCLASS][NBINS];   /* partial lists, fullest bin first */
 static uint32_t        g_bin_extents[NBINS];         /* population of each bin, for stats */
+static uint32_t        g_nbins = NBINS;              /* VRAM_ALLOC_BINS; fixed at startup */
 static uint32_t        g_free_head = EXT_NONE;
 static pthread_mutex_t g_alloc_mu;
 
@@ -894,10 +901,10 @@ static void lst_remove(uint32_t *head, uint32_t e)
 static inline uint32_t ext_bin(const struct extent *e)
 {
     if (e->nfree == 0) return BIN_FULL;
-    uint32_t q = ((uint32_t)(e->nslots - e->nfree) * NBINS) / e->nslots;
-    if (q >= NBINS) q = NBINS - 1;   /* unreachable while nfree > 0; keeps the
-                                        index in range regardless */
-    return NBINS - 1 - q;
+    uint32_t q = ((uint32_t)(e->nslots - e->nfree) * g_nbins) / e->nslots;
+    if (q >= g_nbins) q = g_nbins - 1;   /* unreachable while nfree > 0; keeps
+                                            the index in range regardless */
+    return g_nbins - 1 - q;
 }
 
 static void bin_link(uint32_t ei, uint32_t bin)
@@ -926,7 +933,7 @@ static void ext_rebin(uint32_t ei, uint32_t from)
 /* The fullest partial extent of a class, or EXT_NONE if it has none. */
 static uint32_t class_pick(uint32_t cls)
 {
-    for (uint32_t b = 0; b < NBINS; b++)
+    for (uint32_t b = 0; b < g_nbins; b++)
         if (g_class_bin[cls][b] != EXT_NONE) return g_class_bin[cls][b];
     return EXT_NONE;
 }
@@ -1099,9 +1106,10 @@ static int store_init(void)
     size_t alloc_sz = (size_t)g_n_extents * sizeof(struct extent) +
                       (size_t)g_n_extents * EXT_BMWORDS * sizeof(uint64_t);
     printf("[nbd-vram] store: %llu blocks of %u B in %u extents of %u MiB "
-           "(host cost: index %.1f MiB, allocator %.1f MiB)\n",
+           "(host cost: index %.1f MiB, allocator %.1f MiB; %u fullness bin%s)\n",
            (unsigned long long)g_nblocks, CBLK_SIZE, g_n_extents, EXTENT_SIZE >> 20,
-           (double)idx_sz / (1024.0 * 1024.0), (double)alloc_sz / (1024.0 * 1024.0));
+           (double)idx_sz / (1024.0 * 1024.0), (double)alloc_sz / (1024.0 * 1024.0),
+           g_nbins, g_nbins == 1 ? "" : "s");
     return 0;
 }
 
@@ -2087,18 +2095,18 @@ static void bins_log(const char *tag)
     char buf[160];
     int n = 0;
 
-    for (uint32_t b = 0; b < NBINS; b++) {
-        uint32_t lo = (NBINS - 1 - b) * 100 / NBINS;
+    for (uint32_t b = 0; b < g_nbins; b++) {
+        uint32_t lo = (g_nbins - 1 - b) * 100 / g_nbins;
         uint32_t cnt = ST_READ(g_bin_extents[b]);
         int w = snprintf(buf + n, sizeof(buf) - (size_t)n, "%s%u-%u%% %u",
-                         b ? " | " : "", lo, lo + 100 / NBINS, cnt);
+                         b ? " | " : "", lo, lo + 100 / g_nbins, cnt);
         partial += cnt;
         if (w < 0 || (size_t)w >= sizeof(buf) - (size_t)n) break;
         n += w;
     }
 
     for (uint32_t c = 0; c < NCLASS; c++)
-        for (uint32_t b = 0; b < NBINS; b++)
+        for (uint32_t b = 0; b < g_nbins; b++)
             if (ST_READ(g_class_bin[c][b]) != EXT_NONE) { classes++; break; }
 
     /* The counters are read without the lock and can disagree by an allocation
@@ -2225,6 +2233,15 @@ int main(void)
         if (senv) {
             g_stats_interval = atoi(senv);
             if (g_stats_interval < 0) g_stats_interval = 0;
+        }
+        /* Must be settled before store_init() builds the lists and before any
+         * allocation, and never touched again - see the NBINS comment. */
+        const char *aenv = getenv("VRAM_ALLOC_BINS");
+        if (aenv) {
+            int nb = atoi(aenv);
+            if (nb < 1) nb = 1;
+            if (nb > NBINS) nb = NBINS;
+            g_nbins = (uint32_t)nb;
         }
     }
 

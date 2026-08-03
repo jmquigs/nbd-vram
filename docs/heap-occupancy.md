@@ -13,7 +13,8 @@ motivate all three.
 designed and measured against its own baseline, and it did not move occupancy.
 The reasoning in §2 about *why* extents do not drain holds up; the conclusion
 that a placement heuristic can fix it does not. That result changes what §5 is
-for, so it is recorded rather than quietly dropped.
+for, so it is recorded rather than quietly dropped. Whether the change stays at
+all is open, pending the field measurement in §4.2.
 
 ---
 
@@ -318,22 +319,76 @@ Point 3 is the one that should have been caught at design time: the mechanism in
   full and empty ends.
 - §1.2 and §5. Nothing here recovers stranded space; it never claimed to.
 
-### Kept anyway
+### Status: kept for now, pending a field A/B
 
-The change is retained rather than reverted, for reasons that are worth being
-explicit about since it did not deliver what it promised:
+Four arguments were made for keeping it rather than reverting. Three do not
+survive contact with the measurements, and they are recorded here so the
+decision is not made twice on bad grounds:
 
-- The bins line (§3) is the only view of heap shape there is, and it needs the
-  bins to exist.
-- Fullest-first is a sound default independent of drainage: it finishes extents
-  off instead of leaving a spread of half-used ones, which is what keeps the
-  larger-class fallback in §2.1 from being reached prematurely.
-- It costs 1 KiB and a comparison per allocation, both measured as noise.
-- §5 needs a way to say "allocate, but not into a fresh extent"; a class's bins
-  are exactly the structure that makes that expressible.
+- ~~"The bins line (§3) needs the bins to exist."~~ It does not. The same
+  histogram comes from walking `g_ext` at stats time — `used`, `nfree` and
+  `nslots` are all there, 7168 extents × 16 B for a 7 GiB heap, microseconds
+  under `g_alloc_mu`, once a minute. The diagnostic does not require the
+  allocator change.
+- ~~"§5 needs a way to say 'allocate, but not into a fresh extent'."~~ That is
+  `class_pick` returning `EXT_NONE` rather than falling through to
+  `g_free_head`, which is one line against a single head too.
+- ~~"Fullest-first finishes extents off, independent of drainage."~~ Contradicted
+  by the data. End state on the 51-class workload: the single-list build sat at
+  305 extents (90 full, 215 partial), the binned build at 317 (67 full, 250
+  partial). More committed, fewer finished. Reproducible across repeat runs.
+- "It costs 1 KiB and a comparison per allocation." True, and both measure as
+  noise — but cheapness is not a reason to keep code. The cost that matters is
+  four extra list states in surgery that runs under `g_alloc_mu` on the swap
+  path, where a bad relink hands a live slot to a second block. TSan is clean
+  and the harness re-read checks pass, so it is not broken; it is unearned
+  failure surface.
 
-If a future change wants the list machinery gone, the honest summary is that it
-buys visibility and costs nothing, not that it fixed fragmentation.
+On the harness evidence alone the change should be reverted. It is retained
+only because the harness cannot produce the regime the collapse happened in
+(§6), so "no benefit measured" means "no benefit in the regimes reachable
+here". §4.2 is how to settle that.
+
+## 4.2 Settling it on real swap
+
+`VRAM_ALLOC_BINS` selects the policy at runtime: `1` collapses every partial
+extent onto one list and reproduces the old single-head behaviour exactly, `4`
+(the default) is fullness binning. One binary, one workload, one variable — the
+alternative, two builds, leaves the question of whether anything else differed.
+
+Verified faithful: driven through the harness, `VRAM_ALLOC_BINS=1` reproduces
+the separately-compiled single-list build digit for digit (64.9% occupancy, 305
+extents, 90 full + 215 partial), and `=4` reproduces the binned build (62.4%,
+317, 67 + 250). The toggle is not an approximation of the A/B, it is the A/B.
+
+It is read once at startup and must not change afterwards — `ext_rebin()`
+recomputes the bin index it unlinks from, so moving the divisor under a
+populated heap would unlink extents from lists they are not on. The startup
+`store:` line reports the setting in force, so which side a log came from is
+never in doubt.
+
+The measurement:
+
+1. Same machine, same `VRAM_SETUP_SIZE_MB` and `VRAM_DISK_SIZE_MB`, same swap
+   priorities on both runs. Priority matters — see §6's note on `nbd0` above
+   `zram0`; changing it changes the occupancy regime by itself.
+2. Run the workload that produced §1: fill swap with large processes, drain,
+   repeat several times, then exit everything.
+3. Read the stats line after the final drain. **Occupancy is the headline
+   number.** Secondary: `extents used` against `(peak ...)` — whether committed
+   receded at all is the thing an allocation policy could plausibly change —
+   and the effective ratio.
+4. Repeat with the other setting and the same workload.
+
+What would justify keeping it: occupancy materially higher at `=4`, or extents
+receding from peak at `=4` and not at `=1`. Anything inside a couple of points,
+and the harness result stands and the change should come out — the reporting in
+§3 does not depend on it.
+
+Worth knowing before running it: real sessions are not reproducible workloads,
+so a small difference between two runs is not evidence of anything. If the two
+runs disagree by less than the run-to-run spread of the same setting, that is a
+null result, not a win.
 
 ### Success criterion, revised
 

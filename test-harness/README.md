@@ -41,6 +41,11 @@ instead of `../nbd-vram.c`, which is how an allocator change gets A/B'd against
 its own baseline: copy the file, revert the one thing you are measuring, and run
 both.
 
+For the one A/B that already has a switch, `VRAM_ALLOC_BINS=1 ./run.sh
+--fragment` runs the allocator's old single-partial-list policy and `=4` the
+fullness binning, on the same binary. It reproduces the two-build A/B digit for
+digit, so prefer it over `SRC=`.
+
 ## What is covered
 
 | | |
@@ -58,11 +63,13 @@ that group; that is the mechanism firing.
 ## What `--fragment` has shown so far
 
 The default workload settles at **62-66% occupancy** and stays there. The same
-number comes out of a single partial list per class, of fullest-bin-first, and
-of emptiest-bin-first, all within two points of each other - the allocator's
-choice of *which* partial extent to top off is not what determines occupancy.
-What determines it is that every extent ends up holding blocks from two or three
-generations, so none of them ever empties completely.
+number comes out of a single partial list per class (`VRAM_ALLOC_BINS=1`, 64.9%),
+of fullest-bin-first (`=4`, 62.4%), and of emptiest-bin-first (62.6%, a scratch
+build) - all within two points of each other, with the inverse policy scoring the
+same as the one under test. The allocator's choice of *which* partial extent to
+top off is not what determines occupancy. What determines it is that every extent
+ends up holding blocks from two or three generations, so none of them ever
+empties completely.
 
 Two things the harness cannot currently produce, which is worth knowing before
 reading a number here as the whole story:

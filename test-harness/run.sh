@@ -74,6 +74,7 @@ start_daemon() {
     VRAM_DISK_SIZE_MB=$DISK_MB \
     VRAM_NBD_THREADS=$THREADS \
     VRAM_COMPRESS="$CODEC" \
+    VRAM_ALLOC_BINS="${VRAM_ALLOC_BINS:-4}" \
     VRAM_STATS_INTERVAL_SEC="${1:-0}" \
         $DAEMON > daemon.log 2>&1 &
     for _ in $(seq 1 40); do [ -S "$SOCK" ] && return 0; sleep 0.25; done

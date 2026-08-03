@@ -84,6 +84,14 @@ Environment=VRAM_COMPRESS=zstd        # zstd | lz4 | none
 Environment=VRAM_COMPRESS_LEVEL=1     # zstd level
 ```
 
+There is one more, `VRAM_ALLOC_BINS`, which selects how the allocator picks
+which partially-used extent to put the next page in: `4` (the default) prefers
+the fullest, `1` restores the older behaviour of always taking the most recently
+freed one. It exists to A/B the two on a real workload — see
+`docs/heap-occupancy.md` §4.2 — and there is currently no evidence that either
+setting is better, so leave it alone unless you are measuring. The startup
+`store:` line reports which is in force.
+
 `lz4` compresses roughly four times faster for about 30% less capacity - worth it if you care more about sustained throughput than about how much swap you get. `none` turns compression off entirely and clamps the device back to the size of the VRAM, which is how the daemon behaved before this existed.
 
 Both libraries are loaded with `dlopen` at runtime, exactly like `libcuda.so.1`, so there is nothing new to build against and no new package to install. If neither is present the daemon still runs, uncompressed.
