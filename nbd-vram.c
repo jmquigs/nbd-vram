@@ -826,6 +826,24 @@ static inline uint64_t idx_load(uint64_t blk)
 #define EXT_BMWORDS   (EXT_GRAINS / 64)              /* 256 words = 2 KiB per extent */
 #define EXT_NONE      0xFFFFFFFFu
 
+/* Number of buckets in the extent-fullness histogram on the stats line. Purely a
+ * reporting constant: the allocator keeps one partial list per class and takes
+ * from its head, and nothing here influences placement or is visible to it.
+ *
+ * That is deliberate, and it was measured rather than assumed. Bucketing the
+ * partial lists by fullness and allocating from the fullest bucket was
+ * implemented, A/B'd against this single-list behaviour in a host harness, and
+ * then A/B'd again across two multi-hour real swap sessions: mean occupancy
+ * 91.9% either way, and committed extents receding from their peak under
+ * neither. The exact inverse policy scored the same. Which partial extent gets
+ * topped off is not what decides whether extents ever drain, because a fresh
+ * extent is only committed when a class has no partial at all - so while any
+ * hole exists in the class, every new block lands in one regardless. The
+ * policy picks which extent gets contaminated by a foreign generation; it
+ * cannot decline to contaminate one. docs/heap-occupancy.md sections 4.1 and
+ * 4.3 have the numbers; do not re-derive this one by reimplementing it. */
+#define NBINS         4
+
 struct extent {
     uint32_t next, prev;   /* intrusive list: free list, or the class partial list */
     uint16_t nfree;
@@ -839,7 +857,8 @@ static struct extent  *g_ext;
 static uint64_t       *g_extbm;      /* n_extents * EXT_BMWORDS */
 static uint32_t        g_n_extents;
 static uint32_t        g_extents_used;
-static uint32_t        g_class_head[NCLASS];
+static uint32_t        g_extents_peak;               /* high-water mark of the above */
+static uint32_t        g_class_head[NCLASS];         /* partial extents, one list per class */
 static uint32_t        g_free_head = EXT_NONE;
 static pthread_mutex_t g_alloc_mu;
 
@@ -860,6 +879,15 @@ static void lst_remove(uint32_t *head, uint32_t e)
     else                           *head = g_ext[e].next;
     if (g_ext[e].next != EXT_NONE) g_ext[g_ext[e].next].prev = g_ext[e].prev;
     g_ext[e].next = g_ext[e].prev = EXT_NONE;
+}
+
+/* Which fullness bucket an extent falls in, for the stats line only. Bucket 0 is
+ * >= 75% full, NBINS-1 the emptiest. Nothing calls this on the allocation path. */
+static inline uint32_t ext_bin(const struct extent *e)
+{
+    uint32_t q = ((uint32_t)(e->nslots - e->nfree) * NBINS) / e->nslots;
+    if (q >= NBINS) q = NBINS - 1;   /* a full extent; callers exclude those */
+    return NBINS - 1 - q;
 }
 
 /* Hand a fresh extent to a size class. Slots that do not divide evenly into the
@@ -917,7 +945,9 @@ static uint32_t slot_alloc(uint32_t nbytes, uint32_t *slot_bytes)
         lst_remove(&g_free_head, ei);
         ext_init(ei, cls);
         lst_push(&g_class_head[cls], ei);
-        __atomic_fetch_add(&g_extents_used, 1, __ATOMIC_RELAXED);
+        uint32_t used = __atomic_add_fetch(&g_extents_used, 1, __ATOMIC_RELAXED);
+        if (used > ST_READ(g_extents_peak))
+            __atomic_store_n(&g_extents_peak, used, __ATOMIC_RELAXED);
     }
     /* No extent of our own class and no fresh one left: take a slot from a
      * larger class rather than fail while the heap still has room. Wasteful,
@@ -1952,8 +1982,22 @@ static const char *hsize(uint64_t b, char *buf, size_t n)
     return buf;
 }
 
+/* Occupancy: how much of the committed heap actually holds slots. This is the
+ * number that separates "full of data" from "full of holes", and the one the
+ * fragmentation warning keys off. */
+static double heap_occupancy(void)
+{
+    uint64_t commit = heap_committed();
+    return commit ? 100.0 * (double)ST_READ(g_slot_bytes) / (double)commit : 0.0;
+}
+
 /* The line the feature exists to produce: how much the kernel thinks it has
- * stored, how much VRAM that actually costs, and the ratio between them. */
+ * stored, how much VRAM that actually costs, and the ratio between them.
+ *
+ * The headline ratio is stored/committed, not stored/slots: committed VRAM is
+ * what runs out, and the two diverge by exactly the fragmentation. The codec
+ * ratio is kept alongside it because watching them separate is how the
+ * fragmentation becomes visible at all. */
 static void stats_log(const char *tag)
 {
     uint64_t blocks = ST_READ(g_blocks_live);
@@ -1963,12 +2007,16 @@ static void stats_log(const char *tag)
     uint64_t commit = heap_committed();
     char a[32], b[32], c[32], d[32];
 
-    printf("[nbd-vram] %s: stored %s -> %s on device (%.2fx) | heap %s/%s committed (%.1f%%) "
+    printf("[nbd-vram] %s: stored %s -> %s VRAM (%.2fx) | codec %.2fx | occupancy %.1f%% "
+           "| extents %u/%u (peak %u) | heap %s/%s committed (%.1f%%) "
            "| slack %.1f%% | raw %.1f%% | enospc %lu trimmed %lu retries %lu\n",
            tag,
            hsize(stored, a, sizeof(a)),
-           hsize(slots,  b, sizeof(b)),
-           slots  ? (double)stored / (double)slots : 0.0,
+           hsize(commit, b, sizeof(b)),
+           commit ? (double)stored / (double)commit : 0.0,
+           codec  ? (double)stored / (double)codec  : 0.0,
+           heap_occupancy(),
+           ST_READ(g_extents_used), g_n_extents, ST_READ(g_extents_peak),
            hsize(commit, c, sizeof(c)),
            hsize(g_vram_size, d, sizeof(d)),
            g_vram_size ? 100.0 * (double)commit / (double)g_vram_size : 0.0,
@@ -1978,11 +2026,59 @@ static void stats_log(const char *tag)
     fflush(stdout);
 }
 
+/* Second line: where the partial extents actually sit. A healthy heap keeps few
+ * partials and keeps them nearly full; a long tail in the emptiest bucket with a
+ * large `full` count is fragmentation accumulating, and the emptiest buckets are
+ * the target set for any future compaction pass. `classes` is the count of size
+ * classes holding at least one partial extent - holes are class-specific, so a
+ * high number means free space is scattered across classes that cannot lend to
+ * each other downwards. In the field this has been pinned at all 64.
+ *
+ * Derived by walking g_ext rather than from maintained counters, which keeps the
+ * allocator free of reporting state. That costs one pass over the extent array
+ * (16 B each, so 112 KiB for a 7 GiB heap) under g_alloc_mu, once per stats
+ * interval. The lock is on the swap I/O path, so this must stay a tight
+ * arithmetic loop: no I/O, no allocation, no logging inside it. */
+static void extents_log(const char *tag)
+{
+    uint32_t bin[NBINS] = { 0 };
+    uint32_t used = 0, partial = 0, classes = 0;
+    unsigned char cls_seen[NCLASS] = { 0 };
+    char buf[160];
+    int n = 0;
+
+    pthread_mutex_lock(&g_alloc_mu);
+    for (uint32_t i = 0; i < g_n_extents; i++) {
+        const struct extent *e = &g_ext[i];
+        if (!e->used) continue;
+        used++;
+        if (e->nfree == 0) continue;        /* full: on no partial list */
+        partial++;
+        bin[ext_bin(e)]++;
+        if (!cls_seen[e->cls]) { cls_seen[e->cls] = 1; classes++; }
+    }
+    pthread_mutex_unlock(&g_alloc_mu);
+
+    for (uint32_t b = 0; b < NBINS; b++) {
+        uint32_t lo = (NBINS - 1 - b) * 100 / NBINS;
+        int w = snprintf(buf + n, sizeof(buf) - (size_t)n, "%s%u-%u%% %u",
+                         b ? " | " : "", lo, lo + 100 / NBINS, bin[b]);
+        if (w < 0 || (size_t)w >= sizeof(buf) - (size_t)n) break;
+        n += w;
+    }
+
+    printf("[nbd-vram] %s extents: %u used = %u full + %u partial | free %u | "
+           "classes %u | partial by fullness: %s\n",
+           tag, used, used - partial, partial, g_n_extents - used, classes, buf);
+    fflush(stdout);
+}
+
 /* Ticks once a second so shutdown is prompt, but only reports on the interval. */
 static void *stats_worker(void *arg)
 {
     int tick = 0;
     int warned = 0;
+    int frag_warned = 0;
     (void)arg;
 
     while (g_running) {
@@ -2001,11 +2097,33 @@ static void *stats_worker(void *arg)
             warned = level;   /* hysteresis, so it can warn again after recovery */
         }
 
+        /* Fullness alone cannot tell "full of data" from "full of holes", and
+         * the second one is the failure mode that surprises people: the heap
+         * reaches ENOSPC while most of the committed VRAM is empty.
+         *
+         * This catches the obvious cases only, and silence is not health. Swap
+         * slots the kernel frees without discarding (see the TRIM comment in
+         * trim_range) stay live as far as this daemon can tell, so they count
+         * toward occupancy and mask exactly the heaps that need help most: a
+         * field sample at 97% committed and ~20% genuinely occupied reported
+         * 68% here and stayed quiet. docs/heap-occupancy.md section 4.3. */
+        int occ = (int)heap_occupancy();
+        if (!frag_warned && pct >= 75 && occ < 50) {
+            fprintf(stderr, "[nbd-vram] VRAM heap %d%% committed but only %d%% occupied - "
+                            "fragmentation, not data; committed VRAM cannot recede until "
+                            "extents empty completely\n", pct, occ);
+            frag_warned = 1;
+        } else if (frag_warned && (pct < 65 || occ >= 60)) {
+            frag_warned = 0;  /* hysteresis, matching the fullness warning above */
+        }
+
         if (++tick < g_stats_interval) continue;
         tick = 0;
         stats_log("stats");
+        extents_log("stats");
     }
     stats_log("final");
+    extents_log("final");
     return NULL;
 }
 

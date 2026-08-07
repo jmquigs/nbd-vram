@@ -65,12 +65,19 @@ The daemon logs what it is actually achieving once a minute, so you can tune the
 
 ```
 # journalctl -u vram-swap-nbd -f
-[nbd-vram] stats: stored 5.20 GiB -> 1.83 GiB on device (2.84x) | heap 1.91 GiB/7.00 GiB committed (27.3%) | slack 2.4% | raw 0.9% | enospc 0 retries 0
+[nbd-vram] stats: stored 5.20 GiB -> 1.91 GiB VRAM (2.72x) | codec 2.84x | occupancy 98.2% | extents 1956/7168 (peak 2011) | heap 1.91 GiB/7.00 GiB committed (27.3%) | slack 2.4% | raw 0.9% | enospc 0 trimmed 1204331 retries 0
+[nbd-vram] stats extents: 1956 used = 1904 full + 52 partial | free 5212 | classes 44 | partial by fullness: 75-100% 31 | 50-75% 12 | 25-50% 6 | 0-25% 3
 ```
 
-`stored` is what the kernel has put on the device, `on device` is the VRAM it actually occupies, and the multiplier between them is the live compression ratio. `slack` is the cost of rounding each compressed page up to a 64-byte allocation class, `raw` is the share of pages the compressor could not shrink at all, and `enospc` counts writes refused for want of VRAM.
+`stored` is what the kernel has put on the device and `VRAM` is what that actually costs, so the multiplier between them is the ratio to size against - it is the one that decides when writes start failing. `codec` is what the compressor earns before the allocator rounds anything up; the two diverge as the heap fragments.
+
+`occupancy` is how much of the committed VRAM is holding data rather than holes. VRAM is committed in 1 MiB extents and an extent is only released once every slot in it is free, so a heap can be 90% committed and half empty after a large process exits - the daemon warns about exactly that pattern, because freeing more swap will not bring the committed figure down. `slack` is the cost of rounding each compressed page up to a 64-byte allocation class, `raw` is the share of pages the compressor could not shrink at all, and `enospc` counts writes refused for want of VRAM.
+
+The second line breaks the partial extents down by how full they are; a long tail in the low buckets alongside a large `full` count is fragmentation accumulating.
 
 **What happens if you set it too high.** Nothing is corrupted and nothing is lost: once the VRAM is full the daemon returns `ENOSPC` for further writes, the kernel logs `Write-error on swap-device`, keeps that page in RAM, and falls through to the next swap device in priority order. The connection stays up and everything already stored stays readable. You will see it coming in the journal - the daemon warns at 90%, 95% and 99% before it happens.
+
+What it does not do is recover. The kernel sizes the device from its advertised logical capacity, so from its point of view there are still free slots and it keeps sending writes to them; every one fails. The device stays mounted and useless until it is swapped off, and the pages it would have taken land on whatever swap comes next. Reaching this state takes sustained memory-pressure cycling well beyond a normal day's work, but it is a cliff rather than a slope, so give the daemon enough headroom that you never find it.
 
 Two knobs if the default is not what you want:
 
@@ -83,7 +90,9 @@ Environment=VRAM_COMPRESS_LEVEL=1     # zstd level
 
 Both libraries are loaded with `dlopen` at runtime, exactly like `libcuda.so.1`, so there is nothing new to build against and no new package to install. If neither is present the daemon still runs, uncompressed.
 
-**Freed swap is returned to you.** The device advertises discard, and `nbd-vram-connect.sh` passes `--discard=pages` to `swapon`, so when the kernel frees a swap slot the daemon frees the VRAM behind it. This is the main thing keeping an overcommitted device from filling up over time.
+**Freed swap is mostly returned to you.** The device advertises discard, and `nbd-vram-connect.sh` passes `--discard=pages` to `swapon`, so when the kernel discards a swap slot the daemon frees the VRAM behind it. This is the main thing keeping an overcommitted device from filling up over time.
+
+It is not complete, and the shortfall is the kernel's, not the daemon's. Despite its name `--discard=pages` does not discard a slot when it is freed — it schedules an asynchronous discard when an entire swap *cluster* (2 MiB) becomes free. Scattered frees produce no discard at all, so after a long session the daemon can be holding a great deal of data the kernel has already forgotten about. Measured on a real desktop workload, up to 71% of what the daemon held after exiting every large application was in this state. Compare `stored` in the stats line against what `swapon --show` reports for `nbd0` to see how much: the gap is data neither side will ever use again. There is no `swapon` setting that fixes this.
 
 ---
 

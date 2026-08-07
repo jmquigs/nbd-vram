@@ -28,6 +28,7 @@ build is what runs against a real GPU.
 ./run.sh --codec lz4            # ... against another codec: zstd | lz4 | none
 ./run.sh --capacity compressible  # fill the device; should never run out
 ./run.sh --capacity random        # incompressible fill; should hit ENOSPC cleanly
+./run.sh --fragment             # fill/drain/refill cycles; reports occupancy
 ./run.sh --tsan                 # functional suite under ThreadSanitizer
 ./run.sh --all                  # all of the above, in sequence (~4 minutes)
 ```
@@ -35,18 +36,55 @@ build is what runs against a real GPU.
 Needs only `gcc` and `python3`. `run.sh` builds both the stub and the daemon,
 starts a fresh daemon, runs the tests, and tears everything down on exit.
 
+`SRC=/path/to/other.c ./run.sh --fragment` builds a different source file
+instead of `../nbd-vram.c`, which is how an allocator change gets A/B'd against
+its own baseline: copy the file, revert the one thing you are measuring, and run
+both.
+
 ## What is covered
 
 | | |
 |---|---|
 | `nbdtest.py` | A minimal NBD fixed-newstyle client plus ten groups: unwritten blocks reading as zeros, aligned round trips, incompressible data taking the raw path, multi-block and oversized requests, misaligned read-modify-write, repeated overwrite of one block (slot displacement), TRIM reclaiming, out-of-bounds returning EINVAL without dropping the connection, four connections writing and verifying concurrently, and readers hammering one block under continuous rewrite. |
 | `capacity.py` | Fills the whole device and reports the achieved ratio. In `random` mode it drives the heap to full and checks what matters about ENOSPC: that the connection stays up and that everything written beforehand still reads back byte-for-byte. |
+| `fragment.py` | Rolling generations of 2 MiB clusters - written together, trimmed together, lifetimes overlapping - and then reads the occupancy the daemon reports. This is the allocator's steady-state behaviour rather than its correctness: does committed VRAM stay proportional to live data, or does it strand itself in half-empty extents. It also re-reads live and trimmed clusters, which is a real check on the allocator's list surgery. `FRAG_CYCLES`, `FRAG_GEN_CLUSTERS`, `FRAG_LIVE_GENS`, `FRAG_POOL_PAGES`, `FRAG_STALE_PCT` and `FRAG_OCCUPANCY_FLOOR` tune it. |
 
 Group 10 is the one worth keeping. It is the only thing that reaches the
 lock-free read path's validate-after-DMA retry, because a real swap workload
 essentially never issues a read and a write to the same page concurrently — the
 page lock prevents it. Watch `retries` in the daemon's stats line go up during
 that group; that is the mechanism firing.
+
+## What `--fragment` has shown so far
+
+The default workload settles at **62-66% occupancy** and stays there. The same
+number came out of a single partial list per class (64.9%), of fullest-bin-first
+(62.4%) and of emptiest-bin-first (62.6%) when those were built and measured
+against each other - all within two points, with the inverse policy scoring the
+same as the one under test. The allocator's choice of *which* partial extent to
+top off is not what determines occupancy. What determines it is that every extent
+ends up holding blocks from two or three generations, so none of them ever
+empties completely.
+
+Two multi-hour sessions on real swap agreed (`docs/heap-occupancy.md` §4.3): mean
+occupancy 91.9% under both policies, and committed extents receding from their
+peak under neither. The binning was reverted on that evidence; `--fragment`
+remains the regression check on what replaced it.
+
+Two things the harness cannot currently produce, which is worth knowing before
+reading a number here as the whole story:
+
+- **The field collapse to 27.6%.** No configuration tried gets below ~60%.
+  Reproducing it needs a much higher committed high-water mark followed by a
+  scattered drain, not the flat working set this workload holds.
+- **Undiscarded frees at field amplitude.** `FRAG_STALE_PCT` models swap slots
+  the kernel frees without issuing a TRIM. It *raises* reported occupancy rather
+  than lowering it, because those blocks are live slots as far as the daemon can
+  tell. They are still the reason extents cannot drain - they just do not show
+  up as holes. The field is worse than anything modelled here: up to **71%** of
+  what the daemon held after a deep drain was already-freed data, so a heap that
+  was genuinely ~20% occupied reported 68%. Any occupancy number this harness
+  prints is an optimistic reading of a real one.
 
 ## Gotchas
 
@@ -59,6 +97,13 @@ Each of these cost real debugging time and none is visible from reading the code
 - **Every run needs a brand new daemon.** Reusing one leaves blocks written, and
   the "unwritten blocks read as zeros" assertions then fail for reasons that
   have nothing to do with the code under test.
+- **Wait for the old daemon to exit before starting the next one.** It drains on
+  SIGTERM and unlinks its own socket on the way out, so a fixed sleep between
+  runs races: the new daemon binds the path, the old one exits and unlinks it,
+  and the readiness loop waits out its timeout on a socket that never returns.
+  It surfaces as `daemon failed to start` above a daemon log showing a perfectly
+  healthy startup, on a different group each run, roughly one `--all` in two.
+  `run.sh` polls `pgrep -x` until both binaries are gone.
 - **One worker serves one connection.** Opening more connections than
   `VRAM_NBD_THREADS` leaves the extras blocked in the handshake forever, which
   looks like a daemon deadlock. `nbdtest.py` takes the worker count and refuses
