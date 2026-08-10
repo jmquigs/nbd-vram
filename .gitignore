@@ -5,3 +5,4 @@ tests/
 .local/
 logs
 
+trimaudit.sh
