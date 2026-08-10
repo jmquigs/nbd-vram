@@ -3,3 +3,5 @@ tests/
 
 # local working files - not shipped
 .local/
+logs
+

@@ -16,15 +16,26 @@ sleep 0.5
 bash nbd-vram-disconnect.sh 2>/dev/null || true
 rm -f /run/nbd-vram.sock /run/nbd-vram-dev
 
-echo "=== building ==="
-make
+if [ -f "Makefile" ]; then 
+    echo "=== building ==="
+    NBD=./nbd-vram
+    make
+else
+    echo "=== Notice: Not building since no Makefile present in cwd (will use system nbd-vram)"
+    NBD=/usr/local/bin/nbd-vram
+fi
+
+if [ ! -x "$NBD" ]; then 
+    echo "Nbd not found: $NBD"
+    exit 1
+fi
 
 if [ -f /tmp/nbd-vram.log ]; then 
     mv -f /tmp/nbd-vram.log /tmp/nbd-vram.log.old
 fi
 
 echo "=== starting nbd-vram daemon ==="
-./nbd-vram > /tmp/nbd-vram.log 2>&1 &
+$NBD > /tmp/nbd-vram.log 2>&1 &
 NBD_PID=$!
 echo "PID: $NBD_PID"
 
