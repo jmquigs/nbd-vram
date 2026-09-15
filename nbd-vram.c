@@ -42,7 +42,10 @@ typedef struct CUctx_st    *CUcontext;
 typedef struct CUstream_st *CUstream;
 
 #define CUDA_SUCCESS           0
-#define CU_CTX_SCHED_AUTO      0
+#define CU_CTX_SCHED_AUTO      0x00
+#define CU_CTX_SCHED_SPIN      0x01
+#define CU_CTX_SCHED_YIELD     0x02
+#define CU_CTX_SCHED_BLOCKING  0x04
 #define CU_STREAM_NON_BLOCKING 1
 
 typedef CUresult (*pfn_cuInit)(unsigned int);
@@ -689,6 +692,16 @@ static unsigned long g_read_retry   = 0;  /* reads whose block was rewritten mid
 static int           g_stats_interval = 60;  /* VRAM_STATS_INTERVAL_SEC, 0 = off */
 static int           g_perf         = 0;  /* VRAM_PERF=1: extended perf instrumentation */
 
+/* How cuStreamSynchronize waits for a copy to land. AUTO is the driver's own
+ * heuristic and stays the default; the alternatives exist because a 4 KiB DtoH
+ * transfers in well under a microsecond, so whatever cuStreamSynchronize costs
+ * above that is wait-strategy overhead, and on a latency-bound swap-in path
+ * that overhead IS the cost. SPIN trades a burning core for the wakeup.
+ * VRAM_CU_SCHED=auto|spin|yield|blocking - an A/B knob for measurement, not a
+ * tuning recommendation; set VRAM_PERF=1 alongside it and read perf/sync. */
+static unsigned      g_cu_sched     = CU_CTX_SCHED_AUTO;
+static const char   *g_cu_sched_name = "auto";
+
 /* The stats thread reads these while workers are updating them. Every update is
  * atomic (either __sync_fetch_and_add or, for the two the allocator owns, a
  * relaxed atomic under g_alloc_mu), so this read is well-defined rather than
@@ -734,10 +747,21 @@ static int           g_perf         = 0;  /* VRAM_PERF=1: extended perf instrume
 #define PERF_CLEN_BUCKETS  17   /* 256-byte bins over 4 KiB; [16] = stored raw  */
 
 struct perf_worker {
-    /* Connection wall time. ns_conn accumulates on disconnect; conn_start is
-     * the live connection's start, so a reader can see elapsed time on a
-     * connection that has been up for hours without waiting for it to end. */
+    /* Wall-clock spans that can still be IN PROGRESS when the stats thread
+     * reads them. Each is a (total, start-of-current) pair: the accumulator is
+     * only advanced when the span ends, so without the start the reader sees a
+     * span that has been running for hours as zero, and then sees the whole
+     * thing land in one interval when it finally ends.
+     *
+     * That is not hypothetical - it is what the first field run showed. Two of
+     * four workers sat in recv() for the entire 309 s run, contributed 0 to
+     * ns_idle throughout, and then dumped 618 thread-seconds into the final
+     * 9-second window, which reported "idle 1810%". Meanwhile every interval
+     * before it booked those two workers as 50% "other". pf_live_ns is the fix,
+     * and these four fields must stay first in the struct because pf_total
+     * skips them by index. */
     uint64_t ns_conn, conn_start;
+    uint64_t ns_idle, idle_start;
 
     /* Work done */
     uint64_t rd_reqs, wr_reqs, rd_blocks, wr_blocks, rd_bytes, wr_bytes;
@@ -746,12 +770,20 @@ struct perf_worker {
     uint64_t legacy_reqs, rmw_ops, locked_reads;
     uint64_t trims, trim_scanned;
 
+    /* Read locality, per connection. rd_seq counts reads starting exactly where
+     * the previous read on this connection ended, rd_near those within 32
+     * blocks ahead. A swapoff that walks the swap map in order shows up as a
+     * high rd_seq, which is the precondition for prefetching ahead of the
+     * kernel - the only lever that can hide DMA and decompress latency when the
+     * kernel's queue depth is pinned at one request. */
+    uint64_t rd_seq, rd_near, rd_far, rd_next_blk;
+
     /* Allocator */
     uint64_t alloc_calls, alloc_borrow, alloc_fail, free_calls;
     uint64_t ext_scan_words, alloc_contend, free_contend, idx_contend;
 
     /* Time budget (see above) */
-    uint64_t ns_idle, ns_recv, ns_send, ns_comp, ns_decomp;
+    uint64_t ns_recv, ns_send, ns_comp, ns_decomp;
     uint64_t ns_alloc, ns_alloc_wait, ns_free, ns_free_wait;
     uint64_t ns_issue, ns_sync, ns_publish, ns_publish_wait;
 
@@ -782,6 +814,10 @@ static inline uint64_t pf_now(void)
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
+/* Number of leading uint64_t fields pf_total must handle specially: the
+ * (total, start) pairs above. */
+#define PF_LIVE_FIELDS 4
+
 #define PF_ON        (g_perf && g_pf)
 #define PF_T0(v)     uint64_t v = g_perf ? pf_now() : 0
 #define PF_ACC(v, f) do { if (PF_ON) g_pf->f += pf_now() - (v); } while (0)
@@ -806,12 +842,39 @@ static inline int pf_depth_bucket(uint32_t n)
     return b >= PERF_DEPTH_BUCKETS ? PERF_DEPTH_BUCKETS - 1 : b;
 }
 
-/* Connected wall time including the in-flight connection, so deltas between two
- * stats intervals are meaningful on a long-lived connection. */
+/* A (total, start-of-current) span read as of `now`, including the part still in
+ * progress. Deltas between two of these are correct across an interval boundary
+ * precisely because both ends include their in-flight remainder. */
+static inline uint64_t pf_live_ns(uint64_t total, uint64_t start, uint64_t now)
+{
+    return total + ((start && now > start) ? now - start : 0);
+}
+
 static inline uint64_t pf_conn_ns(const struct perf_worker *p, uint64_t now)
 {
-    uint64_t s = __atomic_load_n(&p->conn_start, __ATOMIC_RELAXED);
-    return p->ns_conn + ((s && now > s) ? now - s : 0);
+    return pf_live_ns(p->ns_conn,
+                      __atomic_load_n(&p->conn_start, __ATOMIC_RELAXED), now);
+}
+
+static inline uint64_t pf_idle_ns(const struct perf_worker *p, uint64_t now)
+{
+    return pf_live_ns(p->ns_idle,
+                      __atomic_load_n(&p->idle_start, __ATOMIC_RELAXED), now);
+}
+
+/* Open a live span, and close one, charging its duration to `total`. */
+static inline void pf_span_open(uint64_t *start)
+{
+    if (PF_ON) __atomic_store_n(start, pf_now(), __ATOMIC_RELAXED);
+}
+
+static inline void pf_span_close(uint64_t *start, uint64_t *total)
+{
+    if (PF_ON) {
+        uint64_t st = __atomic_load_n(start, __ATOMIC_RELAXED);
+        __atomic_store_n(start, 0, __ATOMIC_RELAXED);
+        if (st) *total += pf_now() - st;
+    }
 }
 
 static int clients_connected(void) {
@@ -1935,6 +1998,15 @@ static int batch_admit(int fd, const struct nbd_req_hdr *hh, struct worker *w,
     if ((off | len) & (CBLK_SIZE - 1))
         return 0;   /* misaligned: needs the read-modify-write path */
 
+    if (PF_ON && cmd == NBD_CMD_READ) {
+        uint64_t blk = off >> CBLK_SHIFT;
+        uint64_t nxt = g_pf->rd_next_blk;
+        if      (blk == nxt)                        g_pf->rd_seq++;
+        else if (blk > nxt && blk - nxt <= 32)      g_pf->rd_near++;
+        else                                        g_pf->rd_far++;
+        g_pf->rd_next_blk = blk + (len >> CBLK_SHIFT);
+    }
+
     struct bop *req = &w->reqs[ri];
     req->t0     = g_perf ? pf_now() : 0;
     req->handle = hh->handle;
@@ -2049,9 +2121,11 @@ static int handle_client(int fd, struct worker *w)
          * set: a worker that spends its time here is waiting on the kernel, not
          * on VRAM, and no amount of tuning below this line will help. */
         struct nbd_req_hdr h;
-        PF_T0(ti);
-        if (recv_all(fd, &h, sizeof(h)) != 0) return -1;
-        PF_ACC(ti, ns_idle);
+        int rc;
+        if (g_pf) pf_span_open(&g_pf->idle_start);
+        rc = recv_all(fd, &h, sizeof(h));
+        if (g_pf) pf_span_close(&g_pf->idle_start, &g_pf->ns_idle);
+        if (rc != 0) return -1;
         if (ntohl(h.magic) != NBD_REQUEST_MAGIC) {
             fprintf(stderr, "[nbd-vram] bad request magic 0x%x\n", ntohl(h.magic));
             return -1;
@@ -2236,13 +2310,9 @@ static void *thread_worker(void *arg)
         }
         g_client_fds[idx] = cfd;
         printf("[nbd-vram] client connected\n");
-        if (g_perf) __atomic_store_n(&g_pf->conn_start, pf_now(), __ATOMIC_RELAXED);
+        pf_span_open(&g_pf->conn_start);
         handle_client(cfd, &wk);
-        if (g_perf) {
-            uint64_t st = g_pf->conn_start;
-            __atomic_store_n(&g_pf->conn_start, 0, __ATOMIC_RELAXED);
-            if (st) g_pf->ns_conn += pf_now() - st;
-        }
+        pf_span_close(&g_pf->conn_start, &g_pf->ns_conn);
         g_client_fds[idx] = -1;
         close(cfd);
         printf("[nbd-vram] client disconnected\n");
@@ -2375,11 +2445,13 @@ static void pf_total(struct perf_worker *t, uint64_t now)
         const struct perf_worker *p = &g_perfw[i];
         const uint64_t *src = (const uint64_t *)p;
         uint64_t *dst = (uint64_t *)t;
-        /* ns_conn/conn_start are the first two fields and need the live-
-         * connection fixup, so they are handled separately below. */
-        for (size_t k = 2; k < offsetof(struct perf_worker, pad) / sizeof(uint64_t); k++)
+        /* The (total, start) pairs lead the struct and need the in-flight
+         * fixup, so the flat sum skips them and they are added below. */
+        for (size_t k = PF_LIVE_FIELDS;
+             k < offsetof(struct perf_worker, pad) / sizeof(uint64_t); k++)
             dst[k] += src[k];
         t->ns_conn += pf_conn_ns(p, now);
+        t->ns_idle += pf_idle_ns(p, now);
     }
 }
 
@@ -2541,6 +2613,19 @@ static void perf_log(const char *tag)
            h1, h2,
            (unsigned long long)D(legacy_reqs), (unsigned long long)D(rmw_ops),
            (unsigned long long)D(locked_reads));
+
+    /* Read locality. Sequential near 100% with reqs/batch pinned at 1.00 is the
+     * signature of a client that reads in order but one page at a time - the
+     * case prefetching ahead of it would collapse, since the next read's work is
+     * knowable before the request arrives. */
+    {
+        uint64_t loc = D(rd_seq) + D(rd_near) + D(rd_far);
+        printf("[nbd-vram] %s perf/rd-locality: %llu reads | sequential %.1f%% | "
+               "near (+1..32 blk) %.1f%% | elsewhere %.1f%%\n",
+               tag, (unsigned long long)loc,
+               100.0 * pf_div(D(rd_seq), loc), 100.0 * pf_div(D(rd_near), loc),
+               100.0 * pf_div(D(rd_far), loc));
+    }
 
     /* 5. The single global allocator lock, taken twice per written block by
      *    every worker. Contended% climbing with thread count is the signature
@@ -2812,6 +2897,14 @@ int main(void)
         if (bgenv) g_batch_debug = atoi(bgenv) != 0;
         const char *penv = getenv("VRAM_PERF");
         if (penv) g_perf = atoi(penv) != 0;
+        const char *cenv = getenv("VRAM_CU_SCHED");
+        if (cenv && *cenv) {
+            if      (!strcmp(cenv, "spin"))     { g_cu_sched = CU_CTX_SCHED_SPIN;     g_cu_sched_name = "spin"; }
+            else if (!strcmp(cenv, "yield"))    { g_cu_sched = CU_CTX_SCHED_YIELD;    g_cu_sched_name = "yield"; }
+            else if (!strcmp(cenv, "blocking")) { g_cu_sched = CU_CTX_SCHED_BLOCKING; g_cu_sched_name = "blocking"; }
+            else if (strcmp(cenv, "auto"))
+                fprintf(stderr, "[nbd-vram] VRAM_CU_SCHED=%s not recognised, using auto\n", cenv);
+        }
         const char *senv = getenv("VRAM_STATS_INTERVAL_SEC");
         if (senv) {
             g_stats_interval = atoi(senv);
@@ -2834,7 +2927,9 @@ int main(void)
     }
 
     if (_cuDeviceGet(&cu_dev, 0) != CUDA_SUCCESS) goto out;
-    if (_cuCtxCreate(&g_cu_ctx, CU_CTX_SCHED_AUTO, cu_dev) != CUDA_SUCCESS) goto out;
+    if (_cuCtxCreate(&g_cu_ctx, g_cu_sched, cu_dev) != CUDA_SUCCESS) goto out;
+    if (g_cu_sched != CU_CTX_SCHED_AUTO)
+        printf("[nbd-vram] CUDA context sync policy: %s\n", g_cu_sched_name);
 
     const char *env = getenv("VRAM_SETUP_SIZE_MB");
     size_t mb = env ? (size_t)atol(env) : DEFAULT_SIZE_MB;

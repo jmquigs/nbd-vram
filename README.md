@@ -346,8 +346,18 @@ journalctl -u vram-swap-nbd | grep 'perf/'
 | `perf/lat-rd`, `perf/lat-wr` | service latency from header arrival to reply sent, as log2 buckets with p50/p99 |
 | `perf/sync` | distribution of `cuStreamSynchronize` durations - a tight cluster well above a 4 KiB transfer time is fixed per-sync overhead |
 | `perf/clen` | compressed-size histogram in 256 B bins, which is also the input to how the heap fragments |
+| `perf/rd-locality` | how far each read starts from where the previous one on that connection ended. Sequential near 100% alongside `reqs/batch` 1.00 means the client reads in order but one page at a time |
 | `perf/worker` | per-worker busy percentage and request counts. All the traffic on one worker means the kernel is using one NBD connection and the rest of the compression capacity is idle |
 | `perf/trim`, `perf/slow-paths` | TRIM scan cost (`swapon` discards the whole device in one request), and the read-modify-write and locked-read fallbacks |
+
+`VRAM_CU_SCHED=auto|spin|yield|blocking` picks how `cuStreamSynchronize` waits
+for a copy to land. It defaults to `auto`, the driver's own heuristic. A 4 KiB
+transfer crosses PCIe in well under a microsecond, so anything `perf/sync`
+reports above that is wait-strategy overhead - and on a swap-in, where the
+kernel has one request outstanding at a time, that overhead is most of the
+per-page cost. `spin` trades a burning core for the wakeup. This is an A/B knob
+for measurement, not a recommended setting; change it, re-run with `VRAM_PERF=1`
+and compare `perf/sync`.
 
 ---
 

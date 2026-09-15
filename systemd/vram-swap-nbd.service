@@ -35,6 +35,9 @@ Environment=VRAM_STATS_INTERVAL_SEC=60
 # default and free when off; turn it on only while investigating a slow swap in
 # or out. See "Profiling a slow swap in or out" in the README.
 Environment=VRAM_PERF=0
+# How cuStreamSynchronize waits: auto (driver heuristic) | spin | yield |
+# blocking. An A/B knob for latency investigations; leave at auto otherwise.
+Environment=VRAM_CU_SCHED=auto
 
 # Wake GPU before CUDA init to avoid GSP RPC timeout (Xid 119 on laptops)
 ExecStartPre=/usr/bin/nvidia-smi -pm 1
