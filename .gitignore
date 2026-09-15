@@ -6,3 +6,4 @@ tests/
 logs
 
 trimaudit.sh
+systests
