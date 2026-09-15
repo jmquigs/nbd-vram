@@ -359,6 +359,11 @@ per-page cost. `spin` trades a burning core for the wakeup. This is an A/B knob
 for measurement, not a recommended setting; change it, re-run with `VRAM_PERF=1`
 and compare `perf/sync`.
 
+[`docs/io-latency.md`](docs/io-latency.md) is the record of what this
+instrumentation has already found: where a swap page's time actually goes, what
+was tried, what worked, what measurably did not, and the optimisation
+candidates that remain unimplemented.
+
 ---
 
 ### SSD wear
