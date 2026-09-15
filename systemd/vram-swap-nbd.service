@@ -31,6 +31,10 @@ Environment=VRAM_COMPRESS=zstd
 Environment=VRAM_COMPRESS_LEVEL=1
 # Seconds between compression-ratio log lines. 0 disables them.
 Environment=VRAM_STATS_INTERVAL_SEC=60
+# Extended performance instrumentation, on the same interval and on exit. Off by
+# default and free when off; turn it on only while investigating a slow swap in
+# or out. See "Profiling a slow swap in or out" in the README.
+Environment=VRAM_PERF=0
 
 # Wake GPU before CUDA init to avoid GSP RPC timeout (Xid 119 on laptops)
 ExecStartPre=/usr/bin/nvidia-smi -pm 1

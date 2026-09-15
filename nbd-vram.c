@@ -687,6 +687,7 @@ static unsigned long g_enospc      = 0;   /* writes rejected for want of VRAM */
 static unsigned long g_trim_blocks = 0;   /* blocks freed by NBD_CMD_TRIM */
 static unsigned long g_read_retry   = 0;  /* reads whose block was rewritten mid-DMA */
 static int           g_stats_interval = 60;  /* VRAM_STATS_INTERVAL_SEC, 0 = off */
+static int           g_perf         = 0;  /* VRAM_PERF=1: extended perf instrumentation */
 
 /* The stats thread reads these while workers are updating them. Every update is
  * atomic (either __sync_fetch_and_add or, for the two the allocator owns, a
@@ -694,6 +695,124 @@ static int           g_stats_interval = 60;  /* VRAM_STATS_INTERVAL_SEC, 0 = off
  * merely usually-fine. Relaxed is the right ordering: a stats line is allowed
  * to be a few operations stale, it just may not be torn. */
 #define ST_READ(x) __atomic_load_n(&(x), __ATOMIC_RELAXED)
+
+/* -------------------------------------------------------------------------
+ * Extended performance instrumentation (VRAM_PERF=1)
+ *
+ * Off by default and gated on a single global int, so the cost when disabled is
+ * one predictable, never-taken branch per measurement point. Enabled, every
+ * counter lives in the worker's OWN cache-line-aligned record and is updated
+ * with plain non-atomic arithmetic: workers never contend with each other over
+ * instrumentation, which is the whole point - an instrument that serialises the
+ * threads cannot measure why the threads are slow. The stats thread sums the
+ * per-worker records without a lock; the numbers it prints may be a handful of
+ * operations stale, which is exactly as true of the existing stats line.
+ *
+ * The time accumulators are designed to partition a worker's connected wall
+ * time into non-overlapping buckets, so `perf/time` reads as a budget that sums
+ * to ~100%:
+ *
+ *   idle     blocked in recv() waiting for the kernel to send the next request
+ *   recv     reading write payloads and already-queued request headers
+ *   send     writing replies and read payloads back
+ *   comp     ZSTD/LZ4 compression of 4 KiB blocks
+ *   decomp   decompression
+ *   alloc    slot_alloc, including its wait for g_alloc_mu
+ *   free     slot_free, likewise
+ *   issue    cuMemcpy*Async launches (queueing, not transferring)
+ *   sync     cuStreamSynchronize - where the transfers actually land
+ *   publish  the index stripe-lock critical section
+ *   other    the remainder (protocol parsing, bookkeeping, the probes themselves)
+ *
+ * A few accumulators deliberately do NOT partition, because they measure whole
+ * compound paths: ns_rmw, ns_trim and ns_locked_read each nest the buckets
+ * above. They are reported on their own line and labelled inclusive.
+ * ---------------------------------------------------------------------- */
+
+#define PERF_LAT_BUCKETS   20   /* log2 us: [0] <1us, [k] 2^(k-1)..2^k us       */
+#define PERF_DEPTH_BUCKETS  9   /* 1, 2, 3-4, 5-8, ... , >=129                  */
+#define PERF_CLEN_BUCKETS  17   /* 256-byte bins over 4 KiB; [16] = stored raw  */
+
+struct perf_worker {
+    /* Connection wall time. ns_conn accumulates on disconnect; conn_start is
+     * the live connection's start, so a reader can see elapsed time on a
+     * connection that has been up for hours without waiting for it to end. */
+    uint64_t ns_conn, conn_start;
+
+    /* Work done */
+    uint64_t rd_reqs, wr_reqs, rd_blocks, wr_blocks, rd_bytes, wr_bytes;
+    uint64_t h2d_copies, d2h_copies, h2d_bytes, d2h_bytes;
+    uint64_t syncs, batches, batch_reqs, batch_ops;
+    uint64_t legacy_reqs, rmw_ops, locked_reads;
+    uint64_t trims, trim_scanned;
+
+    /* Allocator */
+    uint64_t alloc_calls, alloc_borrow, alloc_fail, free_calls;
+    uint64_t ext_scan_words, alloc_contend, free_contend, idx_contend;
+
+    /* Time budget (see above) */
+    uint64_t ns_idle, ns_recv, ns_send, ns_comp, ns_decomp;
+    uint64_t ns_alloc, ns_alloc_wait, ns_free, ns_free_wait;
+    uint64_t ns_issue, ns_sync, ns_publish, ns_publish_wait;
+
+    /* Inclusive compound paths */
+    uint64_t ns_rmw, ns_trim, ns_locked_read;
+
+    /* Distributions */
+    uint64_t lat_rd[PERF_LAT_BUCKETS], lat_wr[PERF_LAT_BUCKETS];
+    uint64_t lat_sync[PERF_LAT_BUCKETS];
+    uint64_t hist_depth[PERF_DEPTH_BUCKETS], hist_ops[PERF_DEPTH_BUCKETS];
+    uint64_t hist_clen[PERF_CLEN_BUCKETS];
+
+    char pad[64];   /* keep the next worker's counters off this cache line */
+} __attribute__((aligned(64)));
+
+static struct perf_worker g_perfw[NBD_THREADS_MAX];
+
+/* Every probe reaches its record through this rather than through a parameter,
+ * so slot_alloc/slot_free - called from four different paths - can charge their
+ * cost to the right worker without changing every signature. NULL in the stats
+ * thread and in main, which is why PF_ON tests it. */
+static __thread struct perf_worker *g_pf;
+
+static inline uint64_t pf_now(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+#define PF_ON        (g_perf && g_pf)
+#define PF_T0(v)     uint64_t v = g_perf ? pf_now() : 0
+#define PF_ACC(v, f) do { if (PF_ON) g_pf->f += pf_now() - (v); } while (0)
+#define PF_CNT(f, n) do { if (PF_ON) g_pf->f += (uint64_t)(n); } while (0)
+
+/* log2-microsecond bucket. Sub-microsecond lands in 0; bucket k holds
+ * [2^(k-1), 2^k) us, so the top bucket is "262 ms or worse". */
+static inline int pf_lat_bucket(uint64_t ns)
+{
+    uint64_t us = ns / 1000;
+    int b;
+    if (!us) return 0;
+    b = 64 - __builtin_clzll(us);
+    return b >= PERF_LAT_BUCKETS ? PERF_LAT_BUCKETS - 1 : b;
+}
+
+static inline int pf_depth_bucket(uint32_t n)
+{
+    int b;
+    if (n <= 1) return 0;
+    b = 64 - __builtin_clzll((uint64_t)(n - 1));
+    return b >= PERF_DEPTH_BUCKETS ? PERF_DEPTH_BUCKETS - 1 : b;
+}
+
+/* Connected wall time including the in-flight connection, so deltas between two
+ * stats intervals are meaningful on a long-lived connection. */
+static inline uint64_t pf_conn_ns(const struct perf_worker *p, uint64_t now)
+{
+    uint64_t s = __atomic_load_n(&p->conn_start, __ATOMIC_RELAXED);
+    return p->ns_conn + ((s && now > s) ? now - s : 0);
+}
 
 static int clients_connected(void) {
     for (int i = 0; i < g_nbd_threads; i++)
@@ -862,6 +981,25 @@ static uint32_t        g_class_head[NCLASS];         /* partial extents, one lis
 static uint32_t        g_free_head = EXT_NONE;
 static pthread_mutex_t g_alloc_mu;
 
+/* Take g_alloc_mu, and when instrumentation is on measure how long we waited.
+ * trylock first so the uncontended case costs nothing extra and the contended
+ * case is counted rather than inferred: this is a single global lock taken
+ * twice per written block by every worker, so whether it serialises them is a
+ * question the numbers should answer directly. */
+static inline void alloc_lock(uint64_t *waited)
+{
+    *waited = 0;
+    if (PF_ON) {
+        uint64_t t;
+        if (pthread_mutex_trylock(&g_alloc_mu) == 0) return;
+        t = pf_now();
+        pthread_mutex_lock(&g_alloc_mu);
+        *waited = pf_now() - t;
+        return;
+    }
+    pthread_mutex_lock(&g_alloc_mu);
+}
+
 /* Both lists are doubly linked so an extent that empties out can leave its
  * class's partial list without a scan. An extent is on the free list, on
  * exactly one partial list, or (when full) on neither. */
@@ -923,6 +1061,7 @@ static uint32_t ext_take(uint32_t ei)
         int b = __builtin_ctzll(~bm[w]);
         bm[w] |= 1ULL << b;
         e->hint = (uint16_t)w;
+        PF_CNT(ext_scan_words, i + 1);   /* > 1 means the hint missed: fragmentation */
         if (--e->nfree == 0) lst_remove(&g_class_head[e->cls], ei);
         uint32_t slot = w * 64 + (uint32_t)b;
         return ei * EXT_GRAINS + slot * (e->cls + 1u);
@@ -936,8 +1075,10 @@ static uint32_t slot_alloc(uint32_t nbytes, uint32_t *slot_bytes)
 {
     uint32_t cls = (nbytes - 1) / ALLOC_GRAIN;
     uint32_t ei, grain = SLOT_NONE;
+    uint64_t waited;
+    PF_T0(t0);
 
-    pthread_mutex_lock(&g_alloc_mu);
+    alloc_lock(&waited);
 
     ei = g_class_head[cls];
     if (ei == EXT_NONE && g_free_head != EXT_NONE) {
@@ -956,6 +1097,7 @@ static uint32_t slot_alloc(uint32_t nbytes, uint32_t *slot_bytes)
         for (uint32_t c = cls + 1; c < NCLASS; c++) {
             if (g_class_head[c] != EXT_NONE) { ei = g_class_head[c]; break; }
         }
+        if (ei != EXT_NONE) PF_CNT(alloc_borrow, 1);
     }
     if (ei != EXT_NONE) {
         grain = ext_take(ei);
@@ -966,6 +1108,14 @@ static uint32_t slot_alloc(uint32_t nbytes, uint32_t *slot_bytes)
     }
 
     pthread_mutex_unlock(&g_alloc_mu);
+
+    if (PF_ON) {
+        g_pf->ns_alloc      += pf_now() - t0;
+        g_pf->ns_alloc_wait += waited;      /* a subset of ns_alloc, not additional */
+        g_pf->alloc_calls++;
+        if (waited) g_pf->alloc_contend++;
+        if (grain == SLOT_NONE) g_pf->alloc_fail++;
+    }
     return grain;
 }
 
@@ -975,8 +1125,10 @@ static uint32_t slot_alloc(uint32_t nbytes, uint32_t *slot_bytes)
 static uint32_t slot_free(uint32_t grain)
 {
     uint32_t ei = grain / EXT_GRAINS;
+    uint64_t waited;
+    PF_T0(t0);
 
-    pthread_mutex_lock(&g_alloc_mu);
+    alloc_lock(&waited);
 
     struct extent *e = &g_ext[ei];
     uint32_t slot = (grain % EXT_GRAINS) / (e->cls + 1u);
@@ -997,6 +1149,13 @@ static uint32_t slot_free(uint32_t grain)
     __atomic_fetch_sub(&g_slot_bytes, sz, __ATOMIC_RELAXED);
 
     pthread_mutex_unlock(&g_alloc_mu);
+
+    if (PF_ON) {
+        g_pf->ns_free      += pf_now() - t0;
+        g_pf->ns_free_wait += waited;
+        g_pf->free_calls++;
+        if (waited) g_pf->free_contend++;
+    }
     return sz;
 }
 
@@ -1083,6 +1242,7 @@ struct bop {
     uint32_t error;
     char    *slot;     /* uncompressed host staging for this request */
     uint32_t op0, nops;   /* the blocks this request expands into */
+    uint64_t t0;       /* VRAM_PERF: when the header arrived, for service latency */
 };
 
 /* One 4 KiB block transfer: the unit everything below actually moves. */
@@ -1184,8 +1344,14 @@ static int recv_hdr_nb(int fd, struct nbd_req_hdr *h)
 static void wr_prepare(struct worker *w, struct blkop *bo)
 {
     uint32_t slot_bytes = 0;
+    PF_T0(t0);
 
     bo->clen  = comp_block(&w->cc, bo->page, bo->cslot);
+    if (PF_ON) {
+        g_pf->ns_comp += pf_now() - t0;
+        g_pf->hist_clen[bo->clen >= CBLK_SIZE ? PERF_CLEN_BUCKETS - 1
+                                              : bo->clen / 256]++;
+    }
     bo->grain = slot_alloc(bo->clen, &slot_bytes);
     if (bo->grain == SLOT_NONE) {
         bo->err = ENOSPC;
@@ -1208,12 +1374,23 @@ static void wr_publish(struct blkop *bo)
 {
     pthread_mutex_t *mu = IDXL(bo->blk);
     uint64_t old, nv;
+    PF_T0(t0);
 
-    pthread_mutex_lock(mu);
+    if (PF_ON) {
+        if (pthread_mutex_trylock(mu) != 0) {
+            uint64_t t = pf_now();
+            pthread_mutex_lock(mu);
+            g_pf->ns_publish_wait += pf_now() - t;
+            g_pf->idx_contend++;
+        }
+    } else {
+        pthread_mutex_lock(mu);
+    }
     old = idx_load(bo->blk);
     nv  = ent_make(bo->grain, bo->clen, ent_gen(old) + 1);
     __atomic_store_n(&g_index[bo->blk], nv, __ATOMIC_RELEASE);
     pthread_mutex_unlock(mu);
+    PF_ACC(t0, ns_publish);   /* stops here: slot_free below charges itself */
 
     if (ent_clen(old)) {
         slot_free(ent_grain(old));
@@ -1257,13 +1434,18 @@ static int rd_finish(struct worker *w, struct blkop *bo)
      * below is an unambiguous corruption signal rather than a lost race. */
     if (idx_load(bo->blk) != bo->ent) return 1;
 
-    if (decomp_block(&w->cc, bo->cslot, bo->clen, bo->page) != 0) {
+    {
+        PF_T0(t0);
+        int drc = decomp_block(&w->cc, bo->cslot, bo->clen, bo->page);
+        PF_ACC(t0, ns_decomp);
+        if (drc == 0) return 0;
+    }
+    {
         fprintf(stderr, "[nbd-vram] decompress failed for block %llu (%u bytes) - "
                         "VRAM corruption\n",
                 (unsigned long long)bo->blk, bo->clen);
         return -1;
     }
-    return 0;
 }
 
 /* Last-resort single-block read, serialized against publishers so it cannot be
@@ -1274,6 +1456,7 @@ static int rd_block_locked(struct worker *w, uint64_t blk, char *page)
     pthread_mutex_t *mu = IDXL(blk);
     uint64_t ent;
     int rc = 0;
+    PF_T0(t0);
 
     pthread_mutex_lock(mu);
     ent = idx_load(blk);
@@ -1291,7 +1474,22 @@ static int rd_block_locked(struct worker *w, uint64_t blk, char *page)
         }
     }
     pthread_mutex_unlock(mu);
+    if (PF_ON) { g_pf->ns_locked_read += pf_now() - t0; g_pf->locked_reads++; }
     return rc;
+}
+
+/* cuStreamSynchronize with instrumentation. This is where the transfers are
+ * actually waited on, so its cost per sync AND per copy is the number that says
+ * whether the daemon is transfer-bound or launch/round-trip-bound. */
+static inline void pf_sync(struct worker *w)
+{
+    if (!PF_ON) { _cuStreamSynchronize(w->stream); return; }
+    uint64_t t0 = pf_now(), d;
+    _cuStreamSynchronize(w->stream);
+    d = pf_now() - t0;
+    g_pf->ns_sync += d;
+    g_pf->syncs++;
+    g_pf->lat_sync[pf_lat_bucket(d)]++;
 }
 
 /* Phase B for a prepared set of ops, plus phase C. Splitting them would not buy
@@ -1301,6 +1499,7 @@ static int rd_block_locked(struct worker *w, uint64_t blk, char *page)
 static int do_blocks(struct worker *w, struct blkop *ops, uint32_t n)
 {
     int queued = 0;
+    PF_T0(t0);
 
     for (uint32_t i = 0; i < n; i++) {
         struct blkop *bo = &ops[i];
@@ -1315,9 +1514,14 @@ static int do_blocks(struct worker *w, struct blkop *ops, uint32_t n)
             bo->dma = 0;
             continue;
         }
+        if (PF_ON) {
+            if (bo->cmd == NBD_CMD_READ) { g_pf->d2h_copies++; g_pf->d2h_bytes += bo->clen; }
+            else                         { g_pf->h2d_copies++; g_pf->h2d_bytes += bo->clen; }
+        }
         queued++;
     }
-    if (queued) _cuStreamSynchronize(w->stream);   /* one sync for the whole set */
+    PF_ACC(t0, ns_issue);
+    if (queued) pf_sync(w);   /* one sync for the whole set */
 
     /* Reads first: validate, decompress, and collect anything that lost its
      * race for a retry round. */
@@ -1336,6 +1540,7 @@ static int do_blocks(struct worker *w, struct blkop *ops, uint32_t n)
 
         /* Re-snapshot the losers and give them their own sync. */
         int q = 0;
+        PF_T0(tr);
         for (uint32_t i = 0; i < n; i++) {
             struct blkop *bo = &ops[i];
             if (bo->cmd != NBD_CMD_READ || bo->err || bo->dma == 2) continue;
@@ -1347,9 +1552,11 @@ static int do_blocks(struct worker *w, struct blkop *ops, uint32_t n)
                 bo->dma = 0;
                 continue;
             }
+            if (PF_ON) { g_pf->d2h_copies++; g_pf->d2h_bytes += bo->clen; }
             q++;
         }
-        if (q) _cuStreamSynchronize(w->stream);
+        PF_ACC(tr, ns_issue);
+        if (q) pf_sync(w);
     }
     /* Anything still contested after four rounds gets the locked path, which
      * cannot lose. This is what makes the retry loop terminate rather than
@@ -1440,6 +1647,7 @@ static int rmw_block(struct worker *w, uint64_t blk, uint32_t boff,
     uint64_t old;
     uint32_t clen, slot_bytes, grain;
     int err = 0;
+    PF_T0(t0);
 
     pthread_mutex_lock(mu);
 
@@ -1450,7 +1658,8 @@ static int rmw_block(struct worker *w, uint64_t blk, uint32_t boff,
         CUresult r = _cuMemcpyDtoHAsync(w->cscratch, dev_at(ent_grain(old)),
                                         ent_clen(old), w->stream);
         if (r != CUDA_SUCCESS) { err = EIO; goto out; }
-        _cuStreamSynchronize(w->stream);
+        if (PF_ON) { g_pf->d2h_copies++; g_pf->d2h_bytes += ent_clen(old); }
+        pf_sync(w);
         if (decomp_block(&w->cc, w->cscratch, ent_clen(old), w->scratch) != 0) {
             fprintf(stderr, "[nbd-vram] decompress failed for block %llu during RMW\n",
                     (unsigned long long)blk);
@@ -1470,7 +1679,8 @@ static int rmw_block(struct worker *w, uint64_t blk, uint32_t boff,
         err = EIO;
         goto out;
     }
-    _cuStreamSynchronize(w->stream);
+    if (PF_ON) { g_pf->h2d_copies++; g_pf->h2d_bytes += clen; }
+    pf_sync(w);
 
     __atomic_store_n(&g_index[blk], ent_make(grain, clen, ent_gen(old) + 1),
                      __ATOMIC_RELEASE);
@@ -1486,6 +1696,7 @@ static int rmw_block(struct worker *w, uint64_t blk, uint32_t boff,
 
 out:
     pthread_mutex_unlock(mu);
+    if (PF_ON) { g_pf->ns_rmw += pf_now() - t0; g_pf->rmw_ops++; }
     return err;
 }
 
@@ -1554,8 +1765,10 @@ static void trim_range(uint64_t off, uint64_t len)
 {
     uint64_t b0 = (off + CBLK_SIZE - 1) >> CBLK_SHIFT;
     uint64_t b1 = (off + len) >> CBLK_SHIFT;
+    PF_T0(t0);
 
     if (b1 > g_nblocks) b1 = g_nblocks;
+    if (PF_ON) { g_pf->trims++; g_pf->trim_scanned += (b1 > b0) ? b1 - b0 : 0; }
     for (uint64_t b = b0; b < b1; b++) {
         if (!ent_clen(idx_load(b))) continue;
 
@@ -1575,11 +1788,34 @@ static void trim_range(uint64_t off, uint64_t len)
             __sync_fetch_and_add(&g_trim_blocks, 1);
         }
     }
+    PF_ACC(t0, ns_trim);
 }
 
 /* -------------------------------------------------------------------------
  * Request handling
  * ---------------------------------------------------------------------- */
+
+/* Charge one completed READ/WRITE request to the worker's totals and latency
+ * histogram. Shared by the per-request and batched paths so both show up in the
+ * same distribution - a batch that quietly degenerates into single requests is
+ * otherwise invisible. */
+static inline void pf_req_done(uint16_t cmd, uint32_t len, uint64_t t0)
+{
+    uint64_t d;
+    if (!PF_ON || (cmd != NBD_CMD_READ && cmd != NBD_CMD_WRITE)) return;
+    d = pf_now() - t0;
+    if (cmd == NBD_CMD_READ) {
+        g_pf->rd_reqs++;
+        g_pf->rd_bytes  += len;
+        g_pf->rd_blocks += len >> CBLK_SHIFT;
+        g_pf->lat_rd[pf_lat_bucket(d)]++;
+    } else {
+        g_pf->wr_reqs++;
+        g_pf->wr_bytes  += len;
+        g_pf->wr_blocks += len >> CBLK_SHIFT;
+        g_pf->lat_wr[pf_lat_bucket(d)]++;
+    }
+}
 
 /* Per-request path: oversized requests, misaligned ones, FLUSH/TRIM, and
  * VRAM_BATCH=0. Streams through the block layer in IO_BUF_SIZE windows so this
@@ -1592,9 +1828,11 @@ static int handle_one(int fd, const struct nbd_req_hdr *h, struct worker *w)
     uint64_t offset = be64toh(h->from);
     uint32_t length = ntohl(h->len);
     uint32_t error  = 0;
+    PF_T0(t0);
 
     if (g_batch_debug && (cmd == NBD_CMD_READ || cmd == NBD_CMD_WRITE))
         __sync_fetch_and_add(&g_legacy_ops, 1);
+    if (PF_ON && (cmd == NBD_CMD_READ || cmd == NBD_CMD_WRITE)) g_pf->legacy_reqs++;
 
     if ((cmd == NBD_CMD_READ || cmd == NBD_CMD_WRITE || cmd == NBD_CMD_TRIM) &&
         oob(offset, length)) {
@@ -1615,7 +1853,11 @@ static int handle_one(int fd, const struct nbd_req_hdr *h, struct worker *w)
                 uint64_t end = (voff + chunk) & ~(uint64_t)(CBLK_SIZE - 1);
                 if (end > voff) chunk = (uint32_t)(end - voff);
             }
-            if (recv_all(fd, w->iobuf, chunk) != 0) return -1;
+            {
+                PF_T0(tr);
+                if (recv_all(fd, w->iobuf, chunk) != 0) return -1;
+                PF_ACC(tr, ns_recv);
+            }
             if (!error) {
                 int e = store_range(w, voff, w->iobuf, chunk);
                 if (e && (!error || e == EIO)) error = e;
@@ -1636,9 +1878,16 @@ static int handle_one(int fd, const struct nbd_req_hdr *h, struct worker *w)
     resp.magic  = htonl(NBD_RESPONSE_MAGIC);
     resp.error  = htonl(error);
     resp.handle = handle;
-    if (send_all(fd, &resp, sizeof(resp)) != 0) return -1;
+    {
+        PF_T0(ts);
+        if (send_all(fd, &resp, sizeof(resp)) != 0) return -1;
+        PF_ACC(ts, ns_send);
+    }
     if (error == EIO) return -1;   /* real copy failure: hard-reset the connection */
-    if (error)        return 0;    /* bad request or heap full: reported, keep serving */
+    if (error) {                   /* bad request or heap full: reported, keep serving */
+        pf_req_done(cmd, length, t0);
+        return 0;
+    }
 
     if (cmd == NBD_CMD_READ) {
         uint32_t remaining = length;
@@ -1650,11 +1899,16 @@ static int handle_one(int fd, const struct nbd_req_hdr *h, struct worker *w)
                 if (end > voff) chunk = (uint32_t)(end - voff);
             }
             if (load_range(w, voff, w->iobuf, chunk) != 0) return -1;
-            if (send_all(fd, w->iobuf, chunk) != 0) return -1;
+            {
+                PF_T0(ts);
+                if (send_all(fd, w->iobuf, chunk) != 0) return -1;
+                PF_ACC(ts, ns_send);
+            }
             remaining -= chunk;
             voff      += chunk;
         }
     }
+    pf_req_done(cmd, length, t0);
     return 0;
 }
 
@@ -1682,6 +1936,7 @@ static int batch_admit(int fd, const struct nbd_req_hdr *hh, struct worker *w,
         return 0;   /* misaligned: needs the read-modify-write path */
 
     struct bop *req = &w->reqs[ri];
+    req->t0     = g_perf ? pf_now() : 0;
     req->handle = hh->handle;
     req->offset = off;
     req->len    = len;
@@ -1700,7 +1955,9 @@ static int batch_admit(int fd, const struct nbd_req_hdr *hh, struct worker *w,
 
     if (cmd == NBD_CMD_WRITE) {
         /* Drain the payload even when OOB, to stay frame-aligned. */
+        PF_T0(tr);
         if (recv_all(fd, req->slot, len) != 0) return -1;
+        PF_ACC(tr, ns_recv);
     }
     return 1;
 }
@@ -1718,6 +1975,14 @@ static int batch_admit(int fd, const struct nbd_req_hdr *hh, struct worker *w,
 static int flush_batch(int fd, struct worker *w, uint32_t nreq, uint32_t nops)
 {
     int hard_err = 0;
+
+    if (PF_ON) {
+        g_pf->batches++;
+        g_pf->batch_reqs += nreq;
+        g_pf->batch_ops  += nops;
+        g_pf->hist_depth[pf_depth_bucket(nreq)]++;
+        g_pf->hist_ops[pf_depth_bucket(nops)]++;
+    }
 
     for (uint32_t i = 0; i < nops; i++) {
         struct blkop *bo = &w->ops[i];
@@ -1753,6 +2018,7 @@ static int flush_batch(int fd, struct worker *w, uint32_t nreq, uint32_t nops)
 
     for (uint32_t i = 0; i < nreq; i++) {
         struct nbd_resp_hdr resp;
+        PF_T0(ts);
         resp.magic  = htonl(NBD_RESPONSE_MAGIC);
         resp.error  = htonl(w->reqs[i].error);
         resp.handle = w->reqs[i].handle;
@@ -1761,6 +2027,8 @@ static int flush_batch(int fd, struct worker *w, uint32_t nreq, uint32_t nops)
         if (w->reqs[i].cmd == NBD_CMD_READ && !w->reqs[i].error) {
             if (send_all(fd, w->reqs[i].slot, w->reqs[i].len) != 0) return -1;
         }
+        PF_ACC(ts, ns_send);
+        pf_req_done(w->reqs[i].cmd, w->reqs[i].len, w->reqs[i].t0);
     }
     return hard_err ? -1 : 0;   /* EIO: every reply sent, now reset the connection */
 }
@@ -1776,9 +2044,14 @@ static int handle_client(int fd, struct worker *w)
     int depth = g_batch_depth;
 
     while (g_running) {
-        /* Block here for the first request: this is the worker's idle wait. */
+        /* Block here for the first request: this is the worker's idle wait.
+         * Instrumented because it is the single most useful number in the whole
+         * set: a worker that spends its time here is waiting on the kernel, not
+         * on VRAM, and no amount of tuning below this line will help. */
         struct nbd_req_hdr h;
+        PF_T0(ti);
         if (recv_all(fd, &h, sizeof(h)) != 0) return -1;
+        PF_ACC(ti, ns_idle);
         if (ntohl(h.magic) != NBD_REQUEST_MAGIC) {
             fprintf(stderr, "[nbd-vram] bad request magic 0x%x\n", ntohl(h.magic));
             return -1;
@@ -1814,7 +2087,9 @@ static int handle_client(int fd, struct worker *w)
         if (copy_cap > MAX_BATCH_COPIES) copy_cap = MAX_BATCH_COPIES;
 
         while ((int)nreq < depth && nops < copy_cap) {
+            PF_T0(tg);
             int g = recv_hdr_nb(fd, &extra);
+            PF_ACC(tg, ns_recv);
             if (g < 0) return -1;
             if (g == 0) break;                /* nothing more queued right now */
             if (ntohl(extra.magic) != NBD_REQUEST_MAGIC) {
@@ -1922,6 +2197,7 @@ static void *thread_worker(void *arg)
 {
     int idx = (int)(intptr_t)arg;
     struct worker wk;
+    g_pf = &g_perfw[idx];
     /* PF_MEMALLOC_NOIO/PF_LOCAL_THROTTLE are per-task; pthread inheritance of
      * PR_SET_IO_FLUSHER is undocumented, so set it per worker too (cheap, the
      * failure case is already logged once from main). */
@@ -1960,7 +2236,13 @@ static void *thread_worker(void *arg)
         }
         g_client_fds[idx] = cfd;
         printf("[nbd-vram] client connected\n");
+        if (g_perf) __atomic_store_n(&g_pf->conn_start, pf_now(), __ATOMIC_RELAXED);
         handle_client(cfd, &wk);
+        if (g_perf) {
+            uint64_t st = g_pf->conn_start;
+            __atomic_store_n(&g_pf->conn_start, 0, __ATOMIC_RELAXED);
+            if (st) g_pf->ns_conn += pf_now() - st;
+        }
         g_client_fds[idx] = -1;
         close(cfd);
         printf("[nbd-vram] client disconnected\n");
@@ -2073,6 +2355,341 @@ static void extents_log(const char *tag)
     fflush(stdout);
 }
 
+
+/* -------------------------------------------------------------------------
+ * Extended perf reporting (VRAM_PERF=1)
+ *
+ * Everything here reports the DELTA since the previous line, not lifetime
+ * totals, because a lifetime average over a daemon that idles for hours
+ * between swap storms says nothing about the storm. The one exception is the
+ * peak/lifetime figures explicitly labelled as such.
+ * ---------------------------------------------------------------------- */
+
+/* Sum every worker's record into one. Read without locking: each field is a
+ * plain 64-bit load of a value only its own worker writes, so a field may be a
+ * few operations stale but never torn. */
+static void pf_total(struct perf_worker *t, uint64_t now)
+{
+    memset(t, 0, sizeof(*t));
+    for (int i = 0; i < g_nbd_threads; i++) {
+        const struct perf_worker *p = &g_perfw[i];
+        const uint64_t *src = (const uint64_t *)p;
+        uint64_t *dst = (uint64_t *)t;
+        /* ns_conn/conn_start are the first two fields and need the live-
+         * connection fixup, so they are handled separately below. */
+        for (size_t k = 2; k < offsetof(struct perf_worker, pad) / sizeof(uint64_t); k++)
+            dst[k] += src[k];
+        t->ns_conn += pf_conn_ns(p, now);
+    }
+}
+
+static const char *pf_lat_label(int b, char *buf, size_t n)
+{
+    uint64_t us;
+    if (b == 0) { snprintf(buf, n, "<1us"); return buf; }
+    us = 1ULL << (b - 1);
+    if      (us < 1000)    snprintf(buf, n, "%lluus", (unsigned long long)us);
+    else if (us < 1000000) snprintf(buf, n, "%llums", (unsigned long long)(us / 1000));
+    else                   snprintf(buf, n, "%llus",  (unsigned long long)(us / 1000000));
+    return buf;
+}
+
+/* Upper edge, in microseconds, of the bucket the p'th percentile falls in.
+ * Coarse by construction - these are power-of-two buckets - but the shape of a
+ * latency distribution is what matters here, not its third digit. */
+static uint64_t pf_pct(const uint64_t *h, const uint64_t *prev, double pct)
+{
+    uint64_t tot = 0, run = 0, want;
+    int b;
+    for (b = 0; b < PERF_LAT_BUCKETS; b++) tot += h[b] - prev[b];
+    if (!tot) return 0;
+    want = (uint64_t)((double)tot * pct);
+    for (b = 0; b < PERF_LAT_BUCKETS; b++) {
+        run += h[b] - prev[b];
+        if (run >= want) return b == 0 ? 1 : (1ULL << b);
+    }
+    return 1ULL << PERF_LAT_BUCKETS;
+}
+
+/* Render a delta histogram as "label:count" for the non-empty buckets only. */
+static void pf_hist(char *buf, size_t n, const uint64_t *h, const uint64_t *prev,
+                    int nb, int lat)
+{
+    static const char *dl[PERF_DEPTH_BUCKETS] =
+        { "1", "2", "3-4", "5-8", "9-16", "17-32", "33-64", "65-128", "129+" };
+    size_t off = 0;
+    int b;
+    buf[0] = '\0';
+    for (b = 0; b < nb; b++) {
+        char lb[16];
+        uint64_t v = h[b] - prev[b];
+        int w;
+        if (!v) continue;
+        if (lat) pf_lat_label(b, lb, sizeof(lb));
+        else     snprintf(lb, sizeof(lb), "%s", dl[b]);
+        w = snprintf(buf + off, n - off, "%s%s:%llu", off ? " " : "", lb,
+                     (unsigned long long)v);
+        if (w < 0 || (size_t)w >= n - off) break;
+        off += (size_t)w;
+    }
+    if (!off) snprintf(buf, n, "-");
+}
+
+/* Divide guarding the zero-work case, so an idle interval prints 0.00 rather
+ * than nan and stays greppable. */
+static double pf_div(uint64_t a, uint64_t b) { return b ? (double)a / (double)b : 0.0; }
+
+static struct perf_worker g_pf_prev;             /* previous interval's totals   */
+static struct perf_worker g_pf_prev_w[NBD_THREADS_MAX];
+static uint64_t           g_pf_prev_ns;
+
+/* Start the first reporting window. Called once from main before any worker can
+ * touch a counter, so the first interval line covers a real interval instead of
+ * "everything since process start", and so the no-stats-thread path still has a
+ * window to report against. */
+static uint64_t g_pf_base_ns;
+
+static void perf_baseline(void)
+{
+    if (!g_perf) return;
+    g_pf_base_ns = g_pf_prev_ns = pf_now();
+    memset(&g_pf_prev, 0, sizeof(g_pf_prev));
+    memset(g_pf_prev_w, 0, sizeof(g_pf_prev_w));
+}
+
+static void perf_log(const char *tag)
+{
+#define prev    g_pf_prev
+#define prev_w  g_pf_prev_w
+#define prev_ns g_pf_prev_ns
+    struct perf_worker t;
+    uint64_t now = pf_now();
+    double win = prev_ns ? (double)(now - prev_ns) / 1e9 : 0.0;
+    uint64_t conn, busy, other;
+    char h1[256], h2[256], h3[320], h4[320];
+    char rp[16], wp[16], rp9[16], wp9[16];
+
+    if (!g_perf || !prev_ns) return;
+    pf_total(&t, now);
+
+#define D(f) (t.f - prev.f)
+    conn = D(ns_conn);
+    busy = D(ns_recv) + D(ns_send) + D(ns_comp) + D(ns_decomp) + D(ns_alloc) +
+           D(ns_free) + D(ns_issue) + D(ns_sync) + D(ns_publish);
+    other = conn > busy + D(ns_idle) ? conn - busy - D(ns_idle) : 0;
+
+    /* 1. Throughput. Logical bytes are what the kernel moved; DMA bytes are what
+     *    crossed PCIe after compression, and the gap between them is the codec
+     *    doing its job. */
+    printf("[nbd-vram] %s perf/io: window %.1fs | rd %llu req %llu blk %.1f MiB (%.1f MiB/s, %.0f IOPS)"
+           " | wr %llu req %llu blk %.1f MiB (%.1f MiB/s, %.0f IOPS)"
+           " | pcie h2d %.1f MiB d2h %.1f MiB | copies %llu (%.0f/s, %.0f B avg)\n",
+           tag, win,
+           (unsigned long long)D(rd_reqs), (unsigned long long)D(rd_blocks),
+           (double)D(rd_bytes) / 1048576.0, pf_div(D(rd_bytes), 1) / 1048576.0 / (win ? win : 1),
+           pf_div(D(rd_reqs), 1) / (win ? win : 1),
+           (unsigned long long)D(wr_reqs), (unsigned long long)D(wr_blocks),
+           (double)D(wr_bytes) / 1048576.0, pf_div(D(wr_bytes), 1) / 1048576.0 / (win ? win : 1),
+           pf_div(D(wr_reqs), 1) / (win ? win : 1),
+           (double)D(h2d_bytes) / 1048576.0, (double)D(d2h_bytes) / 1048576.0,
+           (unsigned long long)(D(h2d_copies) + D(d2h_copies)),
+           pf_div(D(h2d_copies) + D(d2h_copies), 1) / (win ? win : 1),
+           pf_div(D(h2d_bytes) + D(d2h_bytes), D(h2d_copies) + D(d2h_copies)));
+
+    /* 2. The time budget. Percentages are of CONNECTED worker time summed over
+     *    all workers, so "idle 95%" means the workers were waiting on the
+     *    kernel for 95% of the time they had a client attached - the signal
+     *    that the bottleneck is not in this process at all. */
+    printf("[nbd-vram] %s perf/time: connected %.1f thread-s of %.1f possible | "
+           "idle %.1f%% busy %.1f%% || recv %.1f send %.1f comp %.1f decomp %.1f "
+           "alloc %.1f free %.1f issue %.1f sync %.1f publish %.1f other %.1f (%% of connected)\n",
+           tag, (double)conn / 1e9, win * g_nbd_threads,
+           100.0 * pf_div(D(ns_idle), conn), 100.0 * pf_div(busy, conn),
+           100.0 * pf_div(D(ns_recv), conn),    100.0 * pf_div(D(ns_send), conn),
+           100.0 * pf_div(D(ns_comp), conn),    100.0 * pf_div(D(ns_decomp), conn),
+           100.0 * pf_div(D(ns_alloc), conn),   100.0 * pf_div(D(ns_free), conn),
+           100.0 * pf_div(D(ns_issue), conn),   100.0 * pf_div(D(ns_sync), conn),
+           100.0 * pf_div(D(ns_publish), conn), 100.0 * pf_div(other, conn));
+
+    /* 3. Unit costs. sync/copy is the one to watch: if it dwarfs the ~1 us a
+     *    4 KiB PCIe transfer actually needs, the daemon is launch-bound and the
+     *    fix is fewer, larger copies rather than faster ones. */
+    printf("[nbd-vram] %s perf/unit-us: comp %.2f/blk decomp %.2f/blk alloc %.2f/blk "
+           "free %.2f/blk issue %.2f/copy sync %.2f/batch %.2f/copy "
+           "recv %.2f/req send %.2f/req\n",
+           tag,
+           pf_div(D(ns_comp), D(wr_blocks)) / 1000.0,
+           pf_div(D(ns_decomp), D(rd_blocks)) / 1000.0,
+           pf_div(D(ns_alloc), D(alloc_calls)) / 1000.0,
+           pf_div(D(ns_free), D(free_calls)) / 1000.0,
+           pf_div(D(ns_issue), D(h2d_copies) + D(d2h_copies)) / 1000.0,
+           pf_div(D(ns_sync), D(syncs)) / 1000.0,
+           pf_div(D(ns_sync), D(h2d_copies) + D(d2h_copies)) / 1000.0,
+           pf_div(D(ns_recv), D(rd_reqs) + D(wr_reqs)) / 1000.0,
+           pf_div(D(ns_send), D(rd_reqs) + D(wr_reqs)) / 1000.0);
+
+    /* 4. Batching. Requests per batch at ~1.0 means the kernel never has two
+     *    requests queued at once on a connection, so the shared synchronize has
+     *    nothing to amortise and the device is round-trip-latency-bound. */
+    pf_hist(h1, sizeof(h1), t.hist_depth, prev.hist_depth, PERF_DEPTH_BUCKETS, 0);
+    pf_hist(h2, sizeof(h2), t.hist_ops, prev.hist_ops, PERF_DEPTH_BUCKETS, 0);
+    printf("[nbd-vram] %s perf/batch: %llu batches | reqs/batch %.2f | copies/batch %.2f | "
+           "reqs-per-batch hist %s | copies-per-batch hist %s | legacy %llu rmw %llu "
+           "locked-rd %llu\n",
+           tag, (unsigned long long)D(batches),
+           pf_div(D(batch_reqs), D(batches)), pf_div(D(batch_ops), D(batches)),
+           h1, h2,
+           (unsigned long long)D(legacy_reqs), (unsigned long long)D(rmw_ops),
+           (unsigned long long)D(locked_reads));
+
+    /* 5. The single global allocator lock, taken twice per written block by
+     *    every worker. Contended% climbing with thread count is the signature
+     *    of it becoming the bottleneck. */
+    printf("[nbd-vram] %s perf/alloc: alloc %llu (%.1f%% contended, wait %.1f ms) | "
+           "free %llu (%.1f%% contended, wait %.1f ms) | idx-stripe %llu contended "
+           "(wait %.1f ms) | ext-scan %.2f words/alloc | borrow %llu enospc %llu\n",
+           tag,
+           (unsigned long long)D(alloc_calls),
+           100.0 * pf_div(D(alloc_contend), D(alloc_calls)), (double)D(ns_alloc_wait) / 1e6,
+           (unsigned long long)D(free_calls),
+           100.0 * pf_div(D(free_contend), D(free_calls)), (double)D(ns_free_wait) / 1e6,
+           (unsigned long long)D(idx_contend), (double)D(ns_publish_wait) / 1e6,
+           pf_div(D(ext_scan_words), D(alloc_calls)),
+           (unsigned long long)D(alloc_borrow), (unsigned long long)D(alloc_fail));
+
+    /* 6. Service latency as the kernel sees it: header arrival to reply sent. */
+    pf_hist(h3, sizeof(h3), t.lat_rd, prev.lat_rd, PERF_LAT_BUCKETS, 1);
+    pf_hist(h4, sizeof(h4), t.lat_wr, prev.lat_wr, PERF_LAT_BUCKETS, 1);
+    snprintf(rp,  sizeof(rp),  "%lluus", (unsigned long long)pf_pct(t.lat_rd, prev.lat_rd, 0.50));
+    snprintf(rp9, sizeof(rp9), "%lluus", (unsigned long long)pf_pct(t.lat_rd, prev.lat_rd, 0.99));
+    snprintf(wp,  sizeof(wp),  "%lluus", (unsigned long long)pf_pct(t.lat_wr, prev.lat_wr, 0.50));
+    snprintf(wp9, sizeof(wp9), "%lluus", (unsigned long long)pf_pct(t.lat_wr, prev.lat_wr, 0.99));
+    printf("[nbd-vram] %s perf/lat-rd: p50 <=%s p99 <=%s | %s\n", tag, rp, rp9, h3);
+    printf("[nbd-vram] %s perf/lat-wr: p50 <=%s p99 <=%s | %s\n", tag, wp, wp9, h4);
+
+    /* 7. Where the stream synchronize time actually went. A tight cluster well
+     *    above the transfer time means fixed per-sync overhead. */
+    pf_hist(h1, sizeof(h1), t.lat_sync, prev.lat_sync, PERF_LAT_BUCKETS, 1);
+    printf("[nbd-vram] %s perf/sync: %llu syncs | %s\n",
+           tag, (unsigned long long)D(syncs), h1);
+
+    /* 8. Compressed-size distribution, 256-byte bins. This is what decides the
+     *    size class each block lands in, so it is also the input to how badly
+     *    the heap fragments. */
+    {
+        size_t off = 0;
+        h2[0] = '\0';
+        for (int b = 0; b < PERF_CLEN_BUCKETS; b++) {
+            uint64_t v = t.hist_clen[b] - prev.hist_clen[b];
+            int w;
+            if (!v) continue;
+            if (b == PERF_CLEN_BUCKETS - 1)
+                w = snprintf(h2 + off, sizeof(h2) - off, "%sraw:%llu",
+                             off ? " " : "", (unsigned long long)v);
+            else
+                w = snprintf(h2 + off, sizeof(h2) - off, "%s%d-%d:%llu",
+                             off ? " " : "", b * 256, (b + 1) * 256 - 1,
+                             (unsigned long long)v);
+            if (w < 0 || (size_t)w >= sizeof(h2) - off) break;
+            off += (size_t)w;
+        }
+        if (!off) snprintf(h2, sizeof(h2), "-");
+        printf("[nbd-vram] %s perf/clen: %s\n", tag, h2);
+    }
+
+    /* 9. Per worker, so an imbalance is visible. All the swap traffic landing on
+     *    one worker means the kernel is using one nbd connection, and three
+     *    quarters of the compression capacity is sitting idle. */
+    {
+        size_t off = 0;
+        h3[0] = '\0';
+        for (int i = 0; i < g_nbd_threads; i++) {
+            uint64_t c = pf_conn_ns(&g_perfw[i], now) - pf_conn_ns(&prev_w[i], prev_ns);
+            uint64_t b = (g_perfw[i].ns_recv + g_perfw[i].ns_send + g_perfw[i].ns_comp +
+                          g_perfw[i].ns_decomp + g_perfw[i].ns_alloc + g_perfw[i].ns_free +
+                          g_perfw[i].ns_issue + g_perfw[i].ns_sync + g_perfw[i].ns_publish)
+                       - (prev_w[i].ns_recv + prev_w[i].ns_send + prev_w[i].ns_comp +
+                          prev_w[i].ns_decomp + prev_w[i].ns_alloc + prev_w[i].ns_free +
+                          prev_w[i].ns_issue + prev_w[i].ns_sync + prev_w[i].ns_publish);
+            int w = snprintf(h3 + off, sizeof(h3) - off,
+                             "%sw%d busy %.0f%% rd %llu wr %llu",
+                             off ? " | " : "", i,
+                             100.0 * pf_div(b, c ? c : 1),
+                             (unsigned long long)(g_perfw[i].rd_reqs - prev_w[i].rd_reqs),
+                             (unsigned long long)(g_perfw[i].wr_reqs - prev_w[i].wr_reqs));
+            if (w < 0 || (size_t)w >= sizeof(h3) - off) break;
+            off += (size_t)w;
+        }
+        printf("[nbd-vram] %s perf/worker: %s\n", tag, off ? h3 : "-");
+    }
+
+    /* 10. TRIM. swapon discards the whole device in one request, which walks
+     *     every index entry; if that walk is slow it delays swapon itself. */
+    if (D(trims) || D(ns_trim))
+        printf("[nbd-vram] %s perf/trim: %llu trims | %llu blocks scanned | %.1f ms total "
+               "(%.2f us/trim, inclusive of the frees it does)\n",
+               tag, (unsigned long long)D(trims), (unsigned long long)D(trim_scanned),
+               (double)D(ns_trim) / 1e6, pf_div(D(ns_trim), D(trims)) / 1000.0);
+    if (D(rmw_ops) || D(locked_reads))
+        printf("[nbd-vram] %s perf/slow-paths: rmw %llu (%.1f ms, inclusive) | "
+               "locked reads %llu (%.1f ms, inclusive)\n",
+               tag, (unsigned long long)D(rmw_ops), (double)D(ns_rmw) / 1e6,
+               (unsigned long long)D(locked_reads), (double)D(ns_locked_read) / 1e6);
+
+    /* On exit the interval above covers only the last window, which on a daemon
+     * that has gone quiet is empty. The run as a whole is what someone reading
+     * the log afterwards actually wants, so print it too - and only here, so
+     * the per-minute lines stay one screenful. */
+    if (!strcmp(tag, "final")) {
+        double life = (double)(now - g_pf_base_ns) / 1e9;
+        uint64_t lconn = t.ns_conn;
+        uint64_t lbusy = t.ns_recv + t.ns_send + t.ns_comp + t.ns_decomp +
+                         t.ns_alloc + t.ns_free + t.ns_issue + t.ns_sync + t.ns_publish;
+        printf("[nbd-vram] lifetime perf/io: %.1fs | rd %llu req %llu blk %.1f MiB | "
+               "wr %llu req %llu blk %.1f MiB | pcie h2d %.1f MiB d2h %.1f MiB | "
+               "copies %llu | batches %llu (reqs/batch %.2f) | legacy %llu rmw %llu "
+               "locked-rd %llu | trims %llu (%llu blk scanned, %.1f ms)\n",
+               life,
+               (unsigned long long)t.rd_reqs, (unsigned long long)t.rd_blocks,
+               (double)t.rd_bytes / 1048576.0,
+               (unsigned long long)t.wr_reqs, (unsigned long long)t.wr_blocks,
+               (double)t.wr_bytes / 1048576.0,
+               (double)t.h2d_bytes / 1048576.0, (double)t.d2h_bytes / 1048576.0,
+               (unsigned long long)(t.h2d_copies + t.d2h_copies),
+               (unsigned long long)t.batches, pf_div(t.batch_reqs, t.batches),
+               (unsigned long long)t.legacy_reqs, (unsigned long long)t.rmw_ops,
+               (unsigned long long)t.locked_reads,
+               (unsigned long long)t.trims, (unsigned long long)t.trim_scanned,
+               (double)t.ns_trim / 1e6);
+        printf("[nbd-vram] lifetime perf/time: connected %.1f thread-s | idle %.1f%% "
+               "busy %.1f%% || recv %.1f send %.1f comp %.1f decomp %.1f alloc %.1f "
+               "free %.1f issue %.1f sync %.1f publish %.1f (%% of connected) | "
+               "alloc %llu (%.1f%% contended) free %llu (%.1f%% contended) "
+               "idx-stripe %llu contended\n",
+               (double)lconn / 1e9,
+               100.0 * pf_div(t.ns_idle, lconn), 100.0 * pf_div(lbusy, lconn),
+               100.0 * pf_div(t.ns_recv, lconn),   100.0 * pf_div(t.ns_send, lconn),
+               100.0 * pf_div(t.ns_comp, lconn),   100.0 * pf_div(t.ns_decomp, lconn),
+               100.0 * pf_div(t.ns_alloc, lconn),  100.0 * pf_div(t.ns_free, lconn),
+               100.0 * pf_div(t.ns_issue, lconn),  100.0 * pf_div(t.ns_sync, lconn),
+               100.0 * pf_div(t.ns_publish, lconn),
+               (unsigned long long)t.alloc_calls,
+               100.0 * pf_div(t.alloc_contend, t.alloc_calls),
+               (unsigned long long)t.free_calls,
+               100.0 * pf_div(t.free_contend, t.free_calls),
+               (unsigned long long)t.idx_contend);
+    }
+#undef D
+
+    fflush(stdout);
+    prev = t;
+    prev_ns = now;
+    for (int i = 0; i < g_nbd_threads; i++) prev_w[i] = g_perfw[i];
+#undef prev
+#undef prev_w
+#undef prev_ns
+}
+
 /* Ticks once a second so shutdown is prompt, but only reports on the interval. */
 static void *stats_worker(void *arg)
 {
@@ -2121,9 +2738,11 @@ static void *stats_worker(void *arg)
         tick = 0;
         stats_log("stats");
         extents_log("stats");
+        perf_log("stats");
     }
     stats_log("final");
     extents_log("final");
+    perf_log("final");
     return NULL;
 }
 
@@ -2191,6 +2810,8 @@ int main(void)
         }
         const char *bgenv = getenv("VRAM_BATCH_DEBUG");
         if (bgenv) g_batch_debug = atoi(bgenv) != 0;
+        const char *penv = getenv("VRAM_PERF");
+        if (penv) g_perf = atoi(penv) != 0;
         const char *senv = getenv("VRAM_STATS_INTERVAL_SEC");
         if (senv) {
             g_stats_interval = atoi(senv);
@@ -2318,12 +2939,16 @@ int main(void)
     {
         printf("[nbd-vram] request batching %s (depth %d, slot %d KiB)\n",
                g_batch_enabled ? "on" : "off", g_batch_depth, BATCH_SLOT / 1024);
+        if (g_perf)
+            printf("[nbd-vram] VRAM_PERF=1: extended perf instrumentation on, "
+                   "reporting every %ds and on exit\n", g_stats_interval);
 
         pthread_t threads[NBD_THREADS_MAX];
         pthread_t stats_th;
         int stats_on = g_stats_interval > 0;
 
         for (int i = 0; i < g_nbd_threads; i++) g_client_fds[i] = -1;
+        perf_baseline();
         for (int i = 0; i < g_nbd_threads; i++)
             pthread_create(&threads[i], NULL, thread_worker, (void *)(intptr_t)i);
         if (stats_on && pthread_create(&stats_th, NULL, stats_worker, NULL) != 0)
@@ -2333,6 +2958,10 @@ int main(void)
             pthread_join(threads[i], NULL);
         g_running = 0;
         if (stats_on) pthread_join(stats_th, NULL);
+        /* With the stats thread disabled nothing has ever baselined the perf
+         * window, so this prints the baseline and then the whole run as one
+         * interval - still the right numbers, just one line of them. */
+        if (g_perf && !stats_on) perf_log("final");
     }
     ret = g_worker_failed ? 1 : 0;
 

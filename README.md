@@ -138,6 +138,7 @@ Environment=VRAM_DISK_SIZE_MB=14336    # swap device size the kernel sees (see C
 Environment=VRAM_COMPRESS=zstd         # zstd | lz4 | none
 Environment=VRAM_COMPRESS_LEVEL=1      # zstd level
 Environment=VRAM_STATS_INTERVAL_SEC=60 # ratio logging interval; 0 disables
+Environment=VRAM_PERF=0                # extended perf instrumentation; see Profiling
 Environment=VRAM_SWAP_PRIORITY=1500    # swap priority (higher = used first)
 Environment=VRAM_NBD_THREADS=8         # worker threads; install.sh sets this to nproc
 Environment=VRAM_NBD_CONNECTIONS=8     # nbd connections; keep equal to threads
@@ -307,6 +308,46 @@ Fill the entire 7 GB VRAM swap with RAM at zero free, and the machine stays resp
 The nastier test I ran was using the GPU *while* it was swapping: a 3D render plus a CUDA compute load on the NVIDIA card, with RAM driven to zero so swap floods the same VRAM. It degrades gracefully rather than falling over - the GPU app keeps rendering (the card pegged near 100%), the daemon keeps serving swap, and the machine stays usable, just laggy. Nothing crashed.
 
 The only hard limit is capacity, not stability: while the daemon holds its VRAM, a GPU app gets only what is left, so a large allocation simply fails to start. That is a tuning question, not a crash - see [Using the GPU at the same time](#using-the-gpu-at-the-same-time).
+
+---
+
+### Profiling a slow swap in or out
+
+`VRAM_PERF=1` turns on extended instrumentation. It is **off by default** and
+costs nothing when off - every probe is behind one never-taken branch - so turn
+it on only while investigating, and turn it back off afterwards. Enabled, the
+probes add a pair of `clock_gettime` calls around each measured region. A/B'd in
+the GPU-free harness - where the stub's `memcpy` "DMA" leaves no transfer wait
+for the probes to hide behind, so it is close to a worst case - that costs
+**3-5%**. Good enough to find a bottleneck, not good enough to publish a
+throughput number from.
+
+Counters live in per-worker, cache-line-aligned records updated without atomics,
+so the instrumentation itself never serialises the workers it is measuring.
+
+The extra lines go to the same log on the same `VRAM_STATS_INTERVAL_SEC` cadence
+as the existing stats line, plus a `final` line and a whole-run `lifetime`
+summary on exit:
+
+```sh
+sudo systemctl edit --full vram-swap-nbd    # set VRAM_PERF=1
+sudo systemctl restart vram-swap-nbd
+# ... run the workload ...
+journalctl -u vram-swap-nbd | grep 'perf/'
+```
+
+| line | what it answers |
+|---|---|
+| `perf/io` | throughput and IOPS each way, and how many bytes actually crossed PCIe after compression |
+| `perf/time` | the time budget: what fraction of connected worker time went to idle, recv, send, compress, decompress, alloc, free, copy issue, stream sync and index publish. **Read this one first** - `idle` near 100% means the workers are waiting on the kernel and nothing below this line is the bottleneck |
+| `perf/unit-us` | microseconds per block or per copy for each of those, so a budget line can be traced to a unit cost |
+| `perf/batch` | requests and device copies per batch. `reqs/batch` near 1.00 means the kernel never has two requests queued at once, so the shared `cuStreamSynchronize` has nothing to amortise and the device is round-trip-bound |
+| `perf/alloc` | contention on the single global allocator mutex, taken twice per written block, plus bitmap scan length and size-class borrowing |
+| `perf/lat-rd`, `perf/lat-wr` | service latency from header arrival to reply sent, as log2 buckets with p50/p99 |
+| `perf/sync` | distribution of `cuStreamSynchronize` durations - a tight cluster well above a 4 KiB transfer time is fixed per-sync overhead |
+| `perf/clen` | compressed-size histogram in 256 B bins, which is also the input to how the heap fragments |
+| `perf/worker` | per-worker busy percentage and request counts. All the traffic on one worker means the kernel is using one NBD connection and the rest of the compression capacity is idle |
+| `perf/trim`, `perf/slow-paths` | TRIM scan cost (`swapon` discards the whole device in one request), and the read-modify-write and locked-read fallbacks |
 
 ---
 
