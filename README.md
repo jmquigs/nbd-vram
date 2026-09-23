@@ -126,6 +126,26 @@ swapon --show
 
 The service is enabled on install, so it comes up automatically on every boot.
 
+### Manual install (minimal)
+
+`install-manual.sh` is a stripped-down alternative to `install.sh`. It takes the VRAM allocation and the swap device size as arguments and hardcodes them into the unit:
+
+```sh
+sudo ./install-manual.sh <VRAM_SETUP_SIZE_MB> <VRAM_DISK_SIZE_MB>
+# e.g. 4 GiB of VRAM behind an 8 GiB swap device:
+sudo ./install-manual.sh 4096 8192
+sudo systemctl start vram-swap-nbd
+```
+
+Compared to the full installer it:
+
+- never runs `nvidia-smi` and never sets any `vm.*` sysctl
+- installs no battery / AC power-management units or udev rule
+- does **not** enable `vram-swap-nbd` at boot - start and stop it manually with `systemctl`
+- still installs the suspend hook, but it only tears swap down before sleep; nothing restarts the daemon on resume
+
+To change the sizes, re-run the script with new values. Remove it with `sudo bash uninstall-manual.sh`.
+
 ---
 
 ## Configuration
@@ -319,7 +339,8 @@ Swap is write-heavy, and SSD NAND has a finite number of write cycles. Sending t
 ## Uninstall
 
 ```sh
-sudo bash uninstall.sh
+sudo bash uninstall.sh          # full install
+sudo bash uninstall-manual.sh   # install-manual.sh
 ```
 
 ---

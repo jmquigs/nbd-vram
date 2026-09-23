@@ -1,0 +1,53 @@
+[Unit]
+Description=VRAM Swap via NBD (CUDA memcpy backend) - manual start only
+# Minimal variant installed by install-manual.sh: no nvidia-smi, no sysctl,
+# no power management, and no [Install] section so it can never be enabled
+# at boot. Start it yourself with: systemctl start vram-swap-nbd
+# Start after the display manager so the GUI initialises the NVIDIA GPU (PRIME
+# offload) and claims its VRAM first. (Ignored if no display-manager.)
+After=systemd-modules-load.service nvidia-persistenced.service display-manager.service
+
+[Service]
+Type=notify
+NotifyAccess=main
+
+# VRAM to allocate for swap and the swap device size the kernel sees.
+# Both are set from the install-manual.sh arguments; re-run the installer
+# to change them.
+Environment=VRAM_SETUP_SIZE_MB=7168
+Environment=VRAM_DISK_SIZE_MB=14336
+Environment=VRAM_SWAP_PRIORITY=1500
+Environment=VRAM_NBD_THREADS=4
+Environment=VRAM_NBD_CONNECTIONS=4
+
+# zstd | lz4 | none. zstd level 1 is the ratio/speed knee for 4 KiB pages;
+# lz4 is ~4x faster to compress for ~30% less capacity.
+Environment=VRAM_COMPRESS=zstd
+Environment=VRAM_COMPRESS_LEVEL=1
+# Seconds between compression-ratio log lines. 0 disables them.
+Environment=VRAM_STATS_INTERVAL_SEC=60
+
+ExecStart=/usr/local/bin/nbd-vram
+ExecStartPost=/usr/local/bin/nbd-vram-connect.sh
+ExecStop=/usr/local/bin/nbd-vram-disconnect.sh
+
+LimitMEMLOCK=infinity
+OOMScoreAdjust=-1000
+
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=60
+# Stop runs swapoff (ExecStop), which migrates every in-use page off the
+# device - minutes when GBs are swapped. A short timeout would kill swapoff
+# mid-flight and then the daemon, freeing VRAM that still backed live swap
+# pages. The daemon exits promptly once swap detaches, so a long timeout only
+# ever waits on real swapoff work.
+TimeoutStopSec=1800
+# If the stop times out anyway (swapoff stuck/failed), do NOT SIGKILL - a
+# killed daemon takes live swap pages with it. Leave it running in drain
+# mode, let the unit fail, retry the stop once RAM frees up.
+SendSIGKILL=no
+KillMode=process
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=nbd-vram

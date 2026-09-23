@@ -1,0 +1,27 @@
+[Unit]
+Description=Tear down VRAM swap before sleep so the GPU can power down cleanly
+Documentation=https://github.com/c0dejedi/nbd-vram/issues/19
+# On suspend the NVIDIA driver powers down the GPU, destroying the CUDA context
+# that backs the NBD swap device. Any swap I/O still in flight then blocks forever,
+# which deadlocks the suspend/resume path. So we must swapoff and stop the daemon
+# while the GPU is STILL ALIVE - i.e. ordered before both systemd's sleep services
+# and nvidia's power-down hooks.
+#
+# Manual variant: this unit only tears swap down. It does NOT restart
+# vram-swap-nbd.service on resume - start it again yourself when you want it.
+Before=systemd-suspend.service systemd-hibernate.service systemd-hybrid-sleep.service systemd-suspend-then-hibernate.service
+Before=nvidia-suspend.service nvidia-hibernate.service
+# Without this the unit would stay "active (exited)" after resume and ExecStart
+# (the teardown) would not re-run on the next suspend. StopWhenUnneeded makes
+# systemd deactivate it as soon as sleep.target deactivates on resume, which
+# re-arms the teardown for the next sleep.
+StopWhenUnneeded=yes
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Runs on the way INTO sleep. There is deliberately no ExecStop: nothing runs on resume.
+ExecStart=/usr/local/bin/nbd-vram-sleep-manual.sh pre
+
+[Install]
+WantedBy=sleep.target
