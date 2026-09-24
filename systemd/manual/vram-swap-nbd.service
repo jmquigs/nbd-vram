@@ -27,7 +27,14 @@ Environment=VRAM_COMPRESS_LEVEL=1
 # Seconds between compression-ratio log lines. 0 disables them.
 Environment=VRAM_STATS_INTERVAL_SEC=60
 
-ExecStart=/usr/local/bin/nbd-vram
+# Daemon output goes to the journal AND to /tmp/nbd-vram.log (the file test-nbd.sh
+# writes, which external tooling reads). systemd cannot fan StandardOutput out to
+# two sinks, so bash forks a tee via process substitution and then exec's the
+# daemon: nbd-vram replaces bash as the main PID, so Type=notify, SIGTERM
+# delivery and KillMode=process behave exactly as with a bare ExecStart. tee is
+# a child of the daemon, writes the file and its inherited stdout (the journal),
+# and exits on EOF when the daemon does.
+ExecStart=/bin/bash -c 'exec > >(tee -a /tmp/nbd-vram.log) 2>&1; exec /usr/local/bin/nbd-vram'
 ExecStartPost=/usr/local/bin/nbd-vram-connect.sh
 ExecStop=/usr/local/bin/nbd-vram-disconnect.sh
 

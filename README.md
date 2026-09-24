@@ -143,6 +143,7 @@ Compared to the full installer it:
 - installs no battery / AC power-management units or udev rule
 - does **not** enable `vram-swap-nbd` at boot - start and stop it manually with `systemctl`
 - still installs the suspend hook, but it only tears swap down before sleep; nothing restarts the daemon on resume
+- writes the daemon's output to `/tmp/nbd-vram.log` (the same file `test-nbd.sh` produces) in addition to the journal
 
 To change the sizes, re-run the script with new values. Remove it with `sudo bash uninstall-manual.sh`.
 
