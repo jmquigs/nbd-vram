@@ -17,6 +17,8 @@ rm -f /usr/local/bin/nbd-vram-disconnect.sh
 rm -f /usr/local/bin/nbd-vram-sleep-manual.sh
 rm -f /etc/systemd/system/vram-swap-nbd.service
 rm -f /etc/systemd/system/vram-swap-nbd-suspend.service
+rm -f /etc/system76-scheduler/process-scheduler/nbd-vram.kdl
+systemctl try-restart com.system76.Scheduler.service 2>/dev/null || true
 echo "      OK"
 
 echo "[3/3] Reloading systemd..."

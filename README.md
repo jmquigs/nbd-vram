@@ -126,6 +126,8 @@ swapon --show
 
 The service is enabled on install, so it comes up automatically on every boot.
 
+The daemon runs at nice -10, since it sits on the page-fault path. On Pop!_OS, `system76-scheduler` would silently renice it to +12 along with every other system service, so the installer also drops an exception for it into `/etc/system76-scheduler/process-scheduler/` when that scheduler is present. Check with the `NI` column in `top`, or `systemctl show -p Nice vram-swap-nbd` for what the unit asks.
+
 ### Manual install (minimal)
 
 `install-manual.sh` is a stripped-down alternative to `install.sh`. It takes the VRAM allocation and the swap device size as arguments and hardcodes them into the unit:

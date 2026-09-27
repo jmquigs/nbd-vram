@@ -113,6 +113,16 @@ install -m 755 "$SRC_DIR/nbd-vram-sleep-manual.sh"                  /usr/local/b
 install -m 644 "$SRC_DIR/systemd/manual/vram-swap-nbd.service"         "$UNIT"
 install -m 644 "$SRC_DIR/systemd/manual/vram-swap-nbd-suspend.service" /etc/systemd/system/
 
+# Pop!_OS runs system76-scheduler, which renices every system.slice process
+# to +12 every 60 s and overrides the unit's Nice=-10. Ship an exception so
+# the daemon keeps the priority its unit asks for. Skipped where absent.
+if systemctl cat com.system76.Scheduler.service &>/dev/null; then
+    install -D -m 644 "$SRC_DIR/systemd/system76-scheduler.kdl" \
+        /etc/system76-scheduler/process-scheduler/nbd-vram.kdl
+    systemctl try-restart com.system76.Scheduler.service 2>/dev/null || true
+    echo "      system76-scheduler present: installed a nice-level exception for nbd-vram"
+fi
+
 # Hardcode sizes from the arguments and thread/connection count from nproc
 NCPU=$(nproc)
 sed -i "s/^Environment=VRAM_SETUP_SIZE_MB=.*/Environment=VRAM_SETUP_SIZE_MB=${SETUP_MB}/" "$UNIT"
