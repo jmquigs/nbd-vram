@@ -11,37 +11,50 @@
 #   - VRAM_SETUP_SIZE_MB and VRAM_DISK_SIZE_MB are taken from the command line
 #     and hardcoded into the installed unit. Re-run this script to change them.
 #
-# Usage: sudo ./install-manual.sh <VRAM_SETUP_SIZE_MB> <VRAM_DISK_SIZE_MB>
+# Usage: sudo ./install-manual.sh <VRAM_SETUP_SIZE_MB> <VRAM_DISK_SIZE_MB> [EXTENT_KIB]
 #   VRAM_SETUP_SIZE_MB  VRAM to allocate for swap, in MiB (minimum 1024)
 #   VRAM_DISK_SIZE_MB   size of the swap device the kernel sees, in MiB. Pages
 #                       are compressed before they reach VRAM, so this is
 #                       normally larger than VRAM_SETUP_SIZE_MB (2x is
 #                       conservative for zstd on anonymous pages).
+#   EXTENT_KIB          optional: allocator extent size in KiB, a power of two
+#                       from 16 to 1024 (default 1024). Compiled into the
+#                       daemon as -DEXTENT_SHIFT. Smaller extents empty and
+#                       release VRAM more readily after swap is freed; see
+#                       docs/heap-occupancy.md section 7 before changing it.
 
 set -e
 SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 usage() {
-    echo "usage: sudo $0 <VRAM_SETUP_SIZE_MB> <VRAM_DISK_SIZE_MB>" >&2
+    echo "usage: sudo $0 <VRAM_SETUP_SIZE_MB> <VRAM_DISK_SIZE_MB> [EXTENT_KIB]" >&2
     echo "  VRAM_SETUP_SIZE_MB  VRAM to allocate for swap, in MiB (minimum 1024)" >&2
     echo "  VRAM_DISK_SIZE_MB   swap device size the kernel sees, in MiB (>= VRAM_SETUP_SIZE_MB)" >&2
+    echo "  EXTENT_KIB          allocator extent size in KiB, power of two 16..1024 (default 1024)" >&2
     exit 1
 }
 
 is_uint() { case "$1" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
 
-[ $# -eq 2 ] || usage
+[ $# -eq 2 ] || [ $# -eq 3 ] || usage
 SETUP_MB="$1"
 DISK_MB="$2"
+EXTENT_KIB="${3:-1024}"
 is_uint "$SETUP_MB" || { echo "error: VRAM_SETUP_SIZE_MB must be a whole number" >&2; usage; }
 is_uint "$DISK_MB"  || { echo "error: VRAM_DISK_SIZE_MB must be a whole number" >&2; usage; }
+is_uint "$EXTENT_KIB" || { echo "error: EXTENT_KIB must be a whole number" >&2; usage; }
 [ "$SETUP_MB" -ge 1024 ]      || { echo "error: VRAM_SETUP_SIZE_MB too small (minimum 1024 MiB)" >&2; exit 1; }
 [ "$DISK_MB" -ge "$SETUP_MB" ] || { echo "error: VRAM_DISK_SIZE_MB must be >= VRAM_SETUP_SIZE_MB" >&2; exit 1; }
+# The daemon takes the extent size as a power-of-two shift; 16 KiB..1 MiB is
+# the range its uint16_t per-extent slot counts are sized for.
+EXTENT_SHIFT=""
+for s in 14 15 16 17 18 19 20; do [ "$EXTENT_KIB" -eq $((1 << (s - 10))) ] && EXTENT_SHIFT=$s; done
+[ -n "$EXTENT_SHIFT" ] || { echo "error: EXTENT_KIB must be a power of two from 16 to 1024" >&2; exit 1; }
 [ "$(id -u)" -eq 0 ] || { echo "error: must run as root" >&2; exit 1; }
 
 echo "=== nbd-vram installer (manual variant) ==="
 echo "Source: $SRC_DIR"
-echo "VRAM_SETUP_SIZE_MB=${SETUP_MB}  VRAM_DISK_SIZE_MB=${DISK_MB}"
+echo "VRAM_SETUP_SIZE_MB=${SETUP_MB}  VRAM_DISK_SIZE_MB=${DISK_MB}  EXTENT_KIB=${EXTENT_KIB} (EXTENT_SHIFT=${EXTENT_SHIFT})"
 
 # Stop a running instance cleanly via systemd first so ExecStop runs the safe
 # swapoff before we replace the binary - never pkill a swap-backing daemon out
@@ -87,7 +100,7 @@ echo "      OK"
 
 # Build the daemon
 echo "[2/4] Building nbd-vram daemon..."
-gcc -O2 -Wall ${CFLAGS:-} -o "$SRC_DIR/nbd-vram" "$SRC_DIR/nbd-vram.c" -ldl -lpthread
+gcc -O2 -Wall -DEXTENT_SHIFT="$EXTENT_SHIFT" ${CFLAGS:-} -o "$SRC_DIR/nbd-vram" "$SRC_DIR/nbd-vram.c" -ldl -lpthread
 echo "      OK"
 
 # Install binary, scripts and units
