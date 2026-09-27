@@ -127,7 +127,7 @@ def main(sock, log):
     c = NBD(sock)
     pool = block_pool()
     nclusters = c.size // CLUSTER
-    rnd = random.Random(20260803)
+    rnd = random.Random(int(os.environ.get("FRAG_SEED", 20260803)))
 
     print(f"device {c.size >> 20} MiB = {nclusters} clusters of {CLUSTER >> 20} MiB; "
           f"{CYCLES} cycles of {GEN_CLUSTERS} clusters, {LIVE_GENS} generations live")
