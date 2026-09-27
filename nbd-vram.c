@@ -820,8 +820,14 @@ static inline uint64_t idx_load(uint64_t blk)
 #define SLOT_NONE     0xFFFFFFFFu                    /* allocation failed / no slot held */
 #define ALLOC_GRAIN   64
 #define NCLASS        (CBLK_SIZE / ALLOC_GRAIN)      /* 64: class k holds (k+1)*64 B */
+/* Overridable at build time (-DEXTENT_SHIFT=17) for A/B measurement on real
+ * swap; the harness result that motivates that is in docs/heap-occupancy.md
+ * section 7. Smaller extents empty more readily; the cost is the unused tail of
+ * each extent, which grows as the extent shrinks toward one slot. */
+#ifndef EXTENT_SHIFT
 #define EXTENT_SHIFT  20
-#define EXTENT_SIZE   (1u << EXTENT_SHIFT)           /* 1 MiB */
+#endif
+#define EXTENT_SIZE   (1u << EXTENT_SHIFT)           /* 1 MiB by default */
 #define EXT_GRAINS    (EXTENT_SIZE / ALLOC_GRAIN)    /* 16384 */
 #define EXT_BMWORDS   (EXT_GRAINS / 64)              /* 256 words = 2 KiB per extent */
 #define EXT_NONE      0xFFFFFFFFu

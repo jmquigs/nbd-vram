@@ -75,7 +75,7 @@ echo "      OK"
 
 # Build the daemon
 echo "[2/4] Building nbd-vram daemon..."
-gcc -O2 -Wall -o "$SRC_DIR/nbd-vram" "$SRC_DIR/nbd-vram.c" -ldl -lpthread
+gcc -O2 -Wall ${CFLAGS:-} -o "$SRC_DIR/nbd-vram" "$SRC_DIR/nbd-vram.c" -ldl -lpthread
 echo "      OK"
 
 # Install binary and service
