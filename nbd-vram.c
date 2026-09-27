@@ -1031,8 +1031,8 @@ static int store_init(void)
 
     g_n_extents = (uint32_t)(g_vram_size / EXTENT_SIZE);
     if (g_n_extents == 0) {
-        fprintf(stderr, "[nbd-vram] VRAM allocation smaller than one %u MiB extent\n",
-                EXTENT_SIZE >> 20);
+        fprintf(stderr, "[nbd-vram] VRAM allocation smaller than one %u KiB extent\n",
+                EXTENT_SIZE >> 10);
         return -1;
     }
     g_ext   = calloc(g_n_extents, sizeof(struct extent));
@@ -1050,9 +1050,9 @@ static int store_init(void)
 
     size_t alloc_sz = (size_t)g_n_extents * sizeof(struct extent) +
                       (size_t)g_n_extents * EXT_BMWORDS * sizeof(uint64_t);
-    printf("[nbd-vram] store: %llu blocks of %u B in %u extents of %u MiB "
+    printf("[nbd-vram] store: %llu blocks of %u B in %u extents of %u KiB "
            "(host cost: index %.1f MiB, allocator %.1f MiB)\n",
-           (unsigned long long)g_nblocks, CBLK_SIZE, g_n_extents, EXTENT_SIZE >> 20,
+           (unsigned long long)g_nblocks, CBLK_SIZE, g_n_extents, EXTENT_SIZE >> 10,
            (double)idx_sz / (1024.0 * 1024.0), (double)alloc_sz / (1024.0 * 1024.0));
     return 0;
 }
