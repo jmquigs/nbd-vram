@@ -75,7 +75,7 @@ echo "      OK"
 
 # Build the daemon
 echo "[2/4] Building nbd-vram daemon..."
-gcc -O2 -Wall -o "$SRC_DIR/nbd-vram" "$SRC_DIR/nbd-vram.c" -ldl -lpthread
+gcc -O2 -Wall ${CFLAGS:-} -o "$SRC_DIR/nbd-vram" "$SRC_DIR/nbd-vram.c" -ldl -lpthread
 echo "      OK"
 
 # Install binary and service
@@ -90,6 +90,16 @@ install -m 755 "$SRC_DIR/nbd-vram-power-check.sh"               /usr/local/bin/n
 install -m 644 "$SRC_DIR/systemd/nbd-vram-power-check.service"  /etc/systemd/system/
 install -m 644 "$SRC_DIR/systemd/nbd-vram-battery-watch.service" /etc/systemd/system/
 install -m 644 "$SRC_DIR/systemd/nbd-vram-battery-watch.timer"  /etc/systemd/system/
+
+# Pop!_OS runs system76-scheduler, which renices every system.slice process
+# to +12 every 60 s and overrides the unit's Nice=-10. Ship an exception so
+# the daemon keeps the priority its unit asks for. Skipped where absent.
+if systemctl cat com.system76.Scheduler.service &>/dev/null; then
+    install -D -m 644 "$SRC_DIR/systemd/system76-scheduler.kdl" \
+        /etc/system76-scheduler/process-scheduler/nbd-vram.kdl
+    systemctl try-restart com.system76.Scheduler.service 2>/dev/null || true
+    echo "      system76-scheduler present: installed a nice-level exception for nbd-vram"
+fi
 mkdir -p /etc/udev/rules.d
 install -m 644 "$SRC_DIR/udev/99-nbd-vram-power.rules"          /etc/udev/rules.d/
 

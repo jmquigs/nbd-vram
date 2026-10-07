@@ -40,6 +40,16 @@ ExecStop=/usr/local/bin/nbd-vram-disconnect.sh
 
 LimitMEMLOCK=infinity
 OOMScoreAdjust=-1000
+# The workers sit on the page-fault path: a process that touches a swapped
+# page waits for them. When every core is busy (a parallel build is also when
+# swap is busiest) a nice-0 thread that wakes can queue behind the run queue
+# for a scheduler slice, milliseconds, before it runs. Nice=-10 puts the
+# workers ahead of that. Deliberately not real-time: the CUDA context uses
+# CU_CTX_SCHED_AUTO, which spin-waits on the GPU, and RT spinning threads
+# would take whole cores from the very processes whose pages they serve.
+# Pop!_OS: system76-scheduler overrides this with nice 12 for everything in
+# system.slice; the installer ships systemd/system76-scheduler.kdl to stop it.
+Nice=-10
 
 Restart=on-failure
 RestartSec=10

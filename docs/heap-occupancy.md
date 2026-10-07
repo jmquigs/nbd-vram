@@ -2,8 +2,10 @@
 
 Status: §3 is implemented and shipped. §4 was implemented, measured on real
 swap (§4.3), found inert and **reverted** — it is kept here as the record of a
-negative result, so it is not proposed again. §5 remains deferred and is now the
-only lever left.
+negative result, so it is not proposed again. §5 remains deferred. §7 (added
+later) measures a lever §4 did not consider, the extent size itself, and finds
+it is not inert in the harness; it is a build-time option awaiting the
+real-swap check.
 Baseline: `nbd-vram.c` as of `develop` (`842d4df`). The measurements in §1 and
 every line number quoted below are against that revision, not against the
 implemented result — the "as implemented" subsections describe what changed.
@@ -718,3 +720,108 @@ Independent of any code change:
 - **`VRAM_DISK_SIZE_MB`.** Sizing should target the *effective* ratio, not the
   codec ratio. Until §4 and §5 land, the effective ratio after a drain cycle is
   the number to budget against.
+
+---
+
+## 7. Extent size
+
+Added after §4 and §5. §4 tested *which* partial extent a block lands in and
+found it does not matter. It did not test how *big* an extent is, and that
+turns out to be a different question with a different answer.
+
+### 7.1 Why it might matter
+
+An extent is released only when every slot in it is free (`slot_free`). At the
+field-average class 17 (1152 B) a 1 MiB extent holds 910 slots, so it empties
+only if 910 blocks die together; a 128 KiB extent holds 113. Blocks written in
+one burst that fall in the same class go to the same head extent, so a small
+extent is more likely to hold blocks from one or two kernel clusters and to
+die with them when those clusters are discarded.
+
+The cost side is small and mostly fixed. The bitmap is one bit per 64 B grain
+whatever the extent size, so it is a constant 0.2% of the heap; only the 16 B
+`struct extent` multiplies (7 GiB: 112 KiB at 1 MiB, 896 KiB at 128 KiB).
+`ext_take` scans fewer bitmap words, fresh-extent commits are more frequent
+but each memsets a smaller bitmap, and nothing on the GPU side notices. What
+does grow is the unused tail of each extent — slots that do not divide the
+extent evenly leave up to one slot's worth of dead space per extent, a larger
+fraction the smaller the extent — and, at the limit, the allocator turns into
+the per-class free stack rejected at `nbd-vram.c:812` for its memory cost.
+
+### 7.2 Harness result
+
+`test-harness/run.sh --fragment`, default workload (24 cycles × 96 clusters,
+2 generations live), the same source built at each `EXTENT_SHIFT`. The
+workload is deterministic for the allocator — each cluster's data is the same
+64-page pool rotated by its cluster number, so the sequence of sizes the
+allocator sees does not depend on the seed; repeat runs and `FRAG_SEED` runs
+reproduce every figure to the digit — so differences below are exact, not
+sampled. `stored` is 384 MiB in every row.
+
+| `EXTENT_SHIFT` | extent | occupancy | committed | extents used / peak | receded from peak |
+|---|---|---|---|---|---|
+| 20 (current) | 1 MiB | 64.9% | 305.0 MiB | 305 / 321 | 5.0% |
+| 19 | 512 KiB | 67.0% | 295.5 MiB | 591 / 619 | 4.5% |
+| 18 | 256 KiB | 73.6% | 268.8 MiB | 1075 / 1213 | 11.4% |
+| 17 | 128 KiB | 82.6% | 239.6 MiB | 1917 / 2420 | 20.8% |
+| 16 | 64 KiB | 89.9% | 220.1 MiB | 3521 / 4869 | 27.7% |
+| 15 | 32 KiB | 92.6% | 213.7 MiB | 6838 / 9919 | 31.1% |
+| 14 | 16 KiB | 90.9% | 217.7 MiB | 13934 / 20624 | 32.4% |
+
+Two things §4 could not produce, both here: occupancy clears the 70% target
+from §6 at 128 KiB and below, and committed extents recede from peak by a
+fifth or more rather than a few percent. The curve rises through 32 KiB and
+turns over at 16 KiB, where the extent-tail waste from §7.1 outgrows the
+drainage gain.
+
+With undiscarded frees modelled (`FRAG_STALE_PCT=20`; 50% overfills the 1 GiB
+stub heap at the default cycle count and is not usable), `stored` is 1.19 GiB
+in every row and the stale blocks inflate occupancy exactly as §4.3 predicts,
+so the column to read is committed VRAM:
+
+| `EXTENT_SHIFT` | extent | occupancy | committed | extents used / peak |
+|---|---|---|---|---|
+| 20 | 1 MiB | 87.3% | 720.0 MiB | 720 / 738 |
+| 19 | 512 KiB | 92.5% | 680.0 MiB | 1360 / 1446 |
+| 18 | 256 KiB | 95.9% | 655.5 MiB | 2622 / 2868 |
+| 17 | 128 KiB | 97.5% | 644.6 MiB | 5157 / 5746 |
+| 16 | 64 KiB | 97.3% | 646.2 MiB | 10339 / 11589 |
+| 15 | 32 KiB | 95.7% | 657.2 MiB | 21030 / 23641 |
+| 14 | 16 KiB | 92.1% | 682.9 MiB | 43705 / 49183 |
+
+The floor here is the stale data itself (1.19 GiB at the codec's 1.97x is
+618 MiB), and 128 KiB gets within 4% of it. Below 128 KiB this table gets
+worse again, by a little at 64 KiB and clearly at 32 and 16 KiB: with stale
+blocks holding extents open, the drainage gain is spent and the extent-tail
+waste is what is left. 128 KiB is the best row here and within 12% of the
+best row in the clean table, so it is the size to carry into the field
+check. Both tables agree that 1 MiB is the worst choice measured.
+
+### 7.3 What this does and does not show
+
+- It is the first allocator-side lever measured here that moves the numbers
+  §4.2 said to watch, and by more than the run-to-run spread the field A/B
+  showed (~11 points).
+- The harness drives one connection. The daemon in the field serves four, all
+  allocating from the same class head, so blocks from different processes are
+  interleaved into an extent at write time in a way the harness does not
+  model. That can only blunt the effect, not reverse it, but it is the reason
+  the harness number is an upper bound.
+- It does nothing for §1.1. A stale block pins its extent whatever the size;
+  a smaller extent just pins less around it. Nor is it compaction: it makes
+  extents drain more often, it does not recover ones that will not.
+- §6 still applies: the harness does not reproduce the field collapse to
+  27.6%, so "occupancy 82.6% in the harness" is not a prediction of the
+  field figure, only of the direction.
+
+### 7.4 Status
+
+`EXTENT_SHIFT` is now a build-time override (`-DEXTENT_SHIFT=17`; the
+Makefile and the installers pass `CFLAGS` through, and `install-manual.sh`
+takes the extent size in KiB as an optional third argument). The default is
+unchanged at 20 pending the real-swap check from §4.2: same machine, same
+sizes and priorities, the §1 workload, one run at the default and one at
+`EXTENT_SHIFT=17`, comparing occupancy and `extents used` against `(peak N)`
+after the final drain. The startup `store:` line names the extent size in
+force, so which build a log came from is never in doubt. If the field agrees
+with the harness, change the default to 17 and note it here.

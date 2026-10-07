@@ -126,16 +126,22 @@ swapon --show
 
 The service is enabled on install, so it comes up automatically on every boot.
 
+The daemon runs at nice -10, since it sits on the page-fault path. On Pop!_OS, `system76-scheduler` would silently renice it to +12 along with every other system service, so the installer also drops an exception for it into `/etc/system76-scheduler/process-scheduler/` when that scheduler is present. Check with the `NI` column in `top`, or `systemctl show -p Nice vram-swap-nbd` for what the unit asks.
+
 ### Manual install (minimal)
 
 `install-manual.sh` is a stripped-down alternative to `install.sh`. It takes the VRAM allocation and the swap device size as arguments and hardcodes them into the unit:
 
 ```sh
-sudo ./install-manual.sh <VRAM_SETUP_SIZE_MB> <VRAM_DISK_SIZE_MB>
+sudo ./install-manual.sh <VRAM_SETUP_SIZE_MB> <VRAM_DISK_SIZE_MB> [EXTENT_KIB]
 # e.g. 4 GiB of VRAM behind an 8 GiB swap device:
 sudo ./install-manual.sh 4096 8192
+# ... the same, with the allocator built for 128 KiB extents instead of 1 MiB:
+sudo ./install-manual.sh 4096 8192 128
 sudo systemctl start vram-swap-nbd
 ```
+
+The optional third argument is the allocator's extent size in KiB (a power of two from 16 to 1024, default 1024) and is compiled into the daemon. Smaller extents give freed VRAM back more readily; `docs/heap-occupancy.md` section 7 has the measurements and the caveats. The full installer and the Makefile take the same setting as `CFLAGS=-DEXTENT_SHIFT=17` (17 for 128 KiB, 18 for 256 KiB, 20 for the default).
 
 Compared to the full installer it:
 

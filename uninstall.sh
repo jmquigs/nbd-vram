@@ -26,6 +26,8 @@ rm -f /etc/systemd/system/nbd-vram-power-check.service
 rm -f /etc/systemd/system/nbd-vram-battery-watch.service
 rm -f /etc/systemd/system/nbd-vram-battery-watch.timer
 rm -f /etc/udev/rules.d/99-nbd-vram-power.rules
+rm -f /etc/system76-scheduler/process-scheduler/nbd-vram.kdl
+systemctl try-restart com.system76.Scheduler.service 2>/dev/null || true
 echo "      OK"
 
 echo "[4/4] Reloading systemd and udev..."

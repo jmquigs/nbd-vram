@@ -1,0 +1,8 @@
+// Installed as /etc/system76-scheduler/process-scheduler/nbd-vram.kdl on
+// systems running system76-scheduler (Pop!_OS). Its stock config renices
+// every process under /system.slice/* to nice 12 every 60 s, which silently
+// overrides the Nice=-10 in vram-swap-nbd.service. Listing the daemon as an
+// exception makes the scheduler leave it alone, so the unit's value holds.
+exceptions {
+    nbd-vram
+}

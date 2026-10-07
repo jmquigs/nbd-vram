@@ -820,8 +820,14 @@ static inline uint64_t idx_load(uint64_t blk)
 #define SLOT_NONE     0xFFFFFFFFu                    /* allocation failed / no slot held */
 #define ALLOC_GRAIN   64
 #define NCLASS        (CBLK_SIZE / ALLOC_GRAIN)      /* 64: class k holds (k+1)*64 B */
+/* Overridable at build time (-DEXTENT_SHIFT=17) for A/B measurement on real
+ * swap; the harness result that motivates that is in docs/heap-occupancy.md
+ * section 7. Smaller extents empty more readily; the cost is the unused tail of
+ * each extent, which grows as the extent shrinks toward one slot. */
+#ifndef EXTENT_SHIFT
 #define EXTENT_SHIFT  20
-#define EXTENT_SIZE   (1u << EXTENT_SHIFT)           /* 1 MiB */
+#endif
+#define EXTENT_SIZE   (1u << EXTENT_SHIFT)           /* 1 MiB by default */
 #define EXT_GRAINS    (EXTENT_SIZE / ALLOC_GRAIN)    /* 16384 */
 #define EXT_BMWORDS   (EXT_GRAINS / 64)              /* 256 words = 2 KiB per extent */
 #define EXT_NONE      0xFFFFFFFFu
@@ -1031,8 +1037,8 @@ static int store_init(void)
 
     g_n_extents = (uint32_t)(g_vram_size / EXTENT_SIZE);
     if (g_n_extents == 0) {
-        fprintf(stderr, "[nbd-vram] VRAM allocation smaller than one %u MiB extent\n",
-                EXTENT_SIZE >> 20);
+        fprintf(stderr, "[nbd-vram] VRAM allocation smaller than one %u KiB extent\n",
+                EXTENT_SIZE >> 10);
         return -1;
     }
     g_ext   = calloc(g_n_extents, sizeof(struct extent));
@@ -1050,9 +1056,9 @@ static int store_init(void)
 
     size_t alloc_sz = (size_t)g_n_extents * sizeof(struct extent) +
                       (size_t)g_n_extents * EXT_BMWORDS * sizeof(uint64_t);
-    printf("[nbd-vram] store: %llu blocks of %u B in %u extents of %u MiB "
+    printf("[nbd-vram] store: %llu blocks of %u B in %u extents of %u KiB "
            "(host cost: index %.1f MiB, allocator %.1f MiB)\n",
-           (unsigned long long)g_nblocks, CBLK_SIZE, g_n_extents, EXTENT_SIZE >> 20,
+           (unsigned long long)g_nblocks, CBLK_SIZE, g_n_extents, EXTENT_SIZE >> 10,
            (double)idx_sz / (1024.0 * 1024.0), (double)alloc_sz / (1024.0 * 1024.0));
     return 0;
 }
